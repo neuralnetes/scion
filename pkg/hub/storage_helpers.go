@@ -113,16 +113,17 @@ func toResourceFiles(files []transfer.FileInfo) []store.TemplateFile {
 
 // uploadResourceFiles uploads a collected directory of resource files to the
 // storage backend under storagePath, one object per file. It returns the
-// manifest of successfully uploaded files and the set of object paths written
-// (used by callers that reconcile stale objects). Per-file open/upload failures
-// are logged and skipped — matching the bootstrap behavior this consolidates —
-// so the loop never fails as a whole. label prefixes the warn messages
-// ("template bootstrap" / "harness config bootstrap").
+// manifest of uploaded files and the set of object paths written (used by
+// callers that reconcile stale objects). Any open/upload failure aborts the
+// whole upload and returns an error: a partial upload would register a resource
+// with a subset of files and a content hash computed over that subset, which
+// later corrupts agent provisioning while masquerading as healthy. label
+// prefixes error messages ("template bootstrap" / "harness config bootstrap").
 //
 // This is shared bootstrap mechanics for the resource-storage refactor (§7.3):
 // templates and harness-configs both route their import/sync upload loop through
 // it, and it is the basis for a future ResourceStore.Bootstrap.
-func uploadResourceFiles(ctx context.Context, stor storage.Storage, storagePath string, files []transfer.FileInfo, log *slog.Logger, label string) ([]store.TemplateFile, map[string]struct{}) {
+func uploadResourceFiles(ctx context.Context, stor storage.Storage, storagePath string, files []transfer.FileInfo, label string) ([]store.TemplateFile, map[string]struct{}, error) {
 	var uploaded []store.TemplateFile
 	written := make(map[string]struct{}, len(files))
 	for _, fi := range files {
@@ -130,15 +131,13 @@ func uploadResourceFiles(ctx context.Context, stor storage.Storage, storagePath 
 
 		f, err := os.Open(fi.FullPath)
 		if err != nil {
-			log.Warn(label+": failed to open file, skipping", "file", fi.Path, "error", err)
-			continue
+			return nil, nil, fmt.Errorf("%s: failed to open file %s: %w", label, fi.Path, err)
 		}
 
 		_, err = stor.Upload(ctx, objectPath, f, storage.UploadOptions{})
 		_ = f.Close()
 		if err != nil {
-			log.Warn(label+": failed to upload file, skipping", "file", fi.Path, "error", err)
-			continue
+			return nil, nil, fmt.Errorf("%s: failed to upload file %s: %w", label, fi.Path, err)
 		}
 
 		uploaded = append(uploaded, store.TemplateFile{
@@ -149,7 +148,7 @@ func uploadResourceFiles(ctx context.Context, stor storage.Storage, storagePath 
 		})
 		written[objectPath] = struct{}{}
 	}
-	return uploaded, written
+	return uploaded, written, nil
 }
 
 // reconcileResourceStorage deletes objects under storagePath that are not in the

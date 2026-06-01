@@ -158,7 +158,10 @@ func (rs *ResourceStore) Bootstrap(ctx context.Context, name, dir, scope, scopeI
 			return false, err
 		}
 
-		uploaded, _ := uploadResourceFiles(ctx, stor, storagePath, files, srv.templateLog, p.Label())
+		uploaded, _, err := uploadResourceFiles(ctx, stor, storagePath, files, p.Label())
+		if err != nil {
+			return false, err
+		}
 		rec.Files = uploaded
 		rec.ContentHash = computeContentHash(uploaded)
 		rec.Status = resourceStatusActive
@@ -184,7 +187,10 @@ func (rs *ResourceStore) Bootstrap(ctx context.Context, name, dir, scope, scopeI
 		storagePath = storage.ResourceStoragePath(kind, existing.Scope, existing.ScopeID, existing.Slug)
 	}
 
-	uploaded, written := uploadResourceFiles(ctx, stor, storagePath, files, srv.templateLog, p.Label())
+	uploaded, written, err := uploadResourceFiles(ctx, stor, storagePath, files, p.Label())
+	if err != nil {
+		return false, err
+	}
 
 	// Reconcile storage: drop objects no longer in the manifest so removed files
 	// don't linger. (Templates already did this on sync; harness-configs gain it
@@ -281,7 +287,9 @@ func (p *templatePersistence) OnHashMatch(ctx context.Context, rec *ResourceReco
 	}
 	t.DefaultHarnessConfig = cfgInfo.DefaultHarnessConfig
 	t.Harness = cfgInfo.Harness
-	_ = p.s.store.UpdateTemplate(ctx, t)
+	if err := p.s.store.UpdateTemplate(ctx, t); err != nil {
+		return false, fmt.Errorf("template bootstrap: failed to backfill defaultHarnessConfig: %w", err)
+	}
 	p.s.importTemplateHarnessConfigs(ctx, dir, t.Scope, t.ScopeID)
 	p.s.templateLog.Info("template bootstrap: backfilled defaultHarnessConfig",
 		"template", t.Name, "defaultHarnessConfig", cfgInfo.DefaultHarnessConfig)
