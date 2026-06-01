@@ -47,6 +47,7 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/storage"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 	"github.com/GoogleCloudPlatform/scion/pkg/store/entadapter"
+	"github.com/GoogleCloudPlatform/scion/pkg/store/postgres"
 	"github.com/GoogleCloudPlatform/scion/pkg/store/sqlite"
 	"github.com/GoogleCloudPlatform/scion/pkg/util"
 	"github.com/GoogleCloudPlatform/scion/pkg/util/logging"
@@ -677,6 +678,38 @@ func initStore(cfg *config.GlobalConfig) (store.Store, error) {
 
 		if err := s.Ping(context.Background()); err != nil {
 			sqliteStore.Close()
+			return nil, fmt.Errorf("database ping failed: %w", err)
+		}
+
+		return s, nil
+	case "postgres":
+		pgStore, err := postgres.New(cfg.Database.URL)
+		if err != nil {
+			return nil, fmt.Errorf("failed to open database: %w", err)
+		}
+
+		if err := pgStore.Migrate(context.Background()); err != nil {
+			pgStore.Close()
+			return nil, fmt.Errorf("failed to run migrations: %w", err)
+		}
+
+		entClient, err := entc.OpenPostgres(cfg.Database.URL)
+		if err != nil {
+			pgStore.Close()
+			return nil, fmt.Errorf("failed to open ent database: %w", err)
+		}
+		if err := entc.AutoMigrate(context.Background(), entClient); err != nil {
+			entClient.Close()
+			pgStore.Close()
+			return nil, fmt.Errorf("failed to run ent migrations: %w", err)
+		}
+
+		// grove->project backfill is a SQLite-era data repair; a fresh Postgres DB has no legacy grove rows, so it is intentionally skipped.
+
+		s := entadapter.NewCompositeStore(pgStore, entClient)
+
+		if err := s.Ping(context.Background()); err != nil {
+			pgStore.Close()
 			return nil, fmt.Errorf("database ping failed: %w", err)
 		}
 

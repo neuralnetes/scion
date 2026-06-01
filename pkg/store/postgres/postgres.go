@@ -1,0 +1,311 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// Package postgres provides a PostgreSQL implementation of the Store interface.
+package postgres
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"time"
+)
+
+// PostgresStore implements the Store interface using PostgreSQL.
+type PostgresStore struct {
+	db *sql.DB
+}
+
+// New creates a new Postgres store with the given connection URL.
+// The URL is passed directly to lib/pq (e.g. "postgres://user:pass@host/db?sslmode=disable").
+func New(connURL string) (*PostgresStore, error) {
+	db, err := sql.Open("postgres", connURL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open database: %w", err)
+	}
+
+	db.SetMaxOpenConns(4)
+	db.SetMaxIdleConns(4)
+
+	return &PostgresStore{db: db}, nil
+}
+
+// Close closes the database connection.
+func (s *PostgresStore) Close() error {
+	return s.db.Close()
+}
+
+// DB returns the underlying *sql.DB for direct access in tests.
+func (s *PostgresStore) DB() *sql.DB {
+	return s.db
+}
+
+// Ping checks database connectivity.
+func (s *PostgresStore) Ping(ctx context.Context) error {
+	return s.db.PingContext(ctx)
+}
+
+// Migrate applies database migrations.
+func (s *PostgresStore) Migrate(ctx context.Context) error {
+	migrations := []any{
+		migrationV1,
+		migrationV2,
+		migrationV3,
+		migrationV4,
+		migrationV5,
+		migrationV6,
+		migrationV7,
+		migrationV8,
+		migrationV9,
+		migrationV10,
+		migrationV11,
+		migrationV12,
+		migrationV13,
+		migrationV14,
+		migrationV15,
+		migrationV16,
+		migrationV17,
+		migrationV18,
+		migrationV19,
+		migrationV20,
+		migrationV21,
+		migrationV22,
+		migrationV23,
+		migrationV24,
+		migrationV25,
+		migrationV26,
+		migrationV27,
+		migrationV28,
+		migrationV29,
+		migrationV30,
+		migrationV31,
+		migrationV32,
+		migrationV33,
+		migrationV34,
+		migrationV35,
+		migrationV36,
+		migrationV37,
+		migrationV38,
+		migrationV39,
+		migrationV40,
+		migrationV41,
+		migrationV42,
+		migrationV43,
+		migrationV44,
+		migrationV45,
+		migrationV46,
+		migrationV47,
+		migrationV48,
+		migrationV49,
+		migrateV50,
+		migrationV51,
+		migrationV52,
+		migrationV53,
+	}
+
+	// Create migrations table if not exists
+	if _, err := s.db.ExecContext(ctx, `
+		CREATE TABLE IF NOT EXISTS schema_migrations (
+			version INTEGER PRIMARY KEY,
+			applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+		)
+	`); err != nil {
+		return fmt.Errorf("failed to create migrations table: %w", err)
+	}
+
+	// Get current version
+	var currentVersion int
+	err := s.db.QueryRowContext(ctx, "SELECT COALESCE(MAX(version), 0) FROM schema_migrations").Scan(&currentVersion)
+	if err != nil {
+		return fmt.Errorf("failed to get current schema version: %w", err)
+	}
+
+	// Migrations that require PRAGMA foreign_keys=OFF around the transaction.
+	// SQLite ignores PRAGMA changes inside transactions, so we must disable
+	// foreign keys before BeginTx and re-enable after Commit. Without this,
+	// DROP TABLE on a parent table triggers ON DELETE CASCADE on child tables.
+	foreignKeysOffMigrations := map[int]bool{
+		40: true, // V40 drops and recreates the projects table
+	}
+
+	// Apply pending migrations
+	for i, migration := range migrations {
+		version := i + 1
+		if version <= currentVersion {
+			continue
+		}
+
+		switch m := migration.(type) {
+		case string:
+			needsFKOff := foreignKeysOffMigrations[version]
+
+			if needsFKOff {
+				if err := s.applyMigrationWithFKOff(ctx, version, m); err != nil {
+					return err
+				}
+				continue
+			}
+
+			tx, err := s.db.BeginTx(ctx, nil)
+			if err != nil {
+				return fmt.Errorf("failed to start transaction for migration %d: %w", version, err)
+			}
+
+			if _, err := tx.ExecContext(ctx, m); err != nil {
+				tx.Rollback()
+				return fmt.Errorf("failed to apply migration %d: %w", version, err)
+			}
+
+			if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations (version) VALUES ($1)", version); err != nil {
+				tx.Rollback()
+				return fmt.Errorf("failed to record migration %d: %w", version, err)
+			}
+
+			if err := tx.Commit(); err != nil {
+				return fmt.Errorf("failed to commit migration %d: %w", version, err)
+			}
+
+		case func(ctx context.Context, tx *sql.Tx) error:
+			tx, err := s.db.BeginTx(ctx, nil)
+			if err != nil {
+				return fmt.Errorf("failed to start transaction for migration %d: %w", version, err)
+			}
+
+			if err := m(ctx, tx); err != nil {
+				tx.Rollback()
+				return fmt.Errorf("failed to apply migration %d: %w", version, err)
+			}
+
+			if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations (version) VALUES ($1)", version); err != nil {
+				tx.Rollback()
+				return fmt.Errorf("failed to record migration %d: %w", version, err)
+			}
+
+			if err := tx.Commit(); err != nil {
+				return fmt.Errorf("failed to commit migration %d: %w", version, err)
+			}
+
+		default:
+			return fmt.Errorf("migration %d: unsupported type %T", version, migration)
+		}
+	}
+
+	return nil
+}
+
+// applyMigrationWithFKOff runs a migration that requires PRAGMA
+// foreign_keys=OFF. In Postgres, foreign key deferral is handled within the
+// migration SQL itself (e.g. DROP ... CASCADE / explicit FK drops), so this
+// function simply runs the migration in a plain transaction. The
+// foreignKeysOffMigrations map and this function are kept so the runner shape
+// stays 1-to-1 with the SQLite implementation.
+func (s *PostgresStore) applyMigrationWithFKOff(ctx context.Context, version int, migration string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to start transaction for migration %d: %w", version, err)
+	}
+
+	if _, err := tx.ExecContext(ctx, migration); err != nil {
+		tx.Rollback()
+		return fmt.Errorf("failed to apply migration %d: %w", version, err)
+	}
+
+	if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations (version) VALUES ($1)", version); err != nil {
+		tx.Rollback()
+		return fmt.Errorf("failed to record migration %d: %w", version, err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit migration %d: %w", version, err)
+	}
+
+	return nil
+}
+
+// Helper functions for JSON marshaling/unmarshaling
+func marshalJSON(v interface{}) string {
+	if v == nil {
+		return ""
+	}
+	data, err := json.Marshal(v)
+	if err != nil {
+		return ""
+	}
+	return string(data)
+}
+
+func unmarshalJSON[T any](data string, v *T) {
+	if data == "" {
+		return
+	}
+	json.Unmarshal([]byte(data), v)
+}
+
+// nullableString returns a sql.NullString for database insertion.
+// Empty strings become NULL, which is important for UNIQUE and FK constraints.
+func nullableString(s string) sql.NullString {
+	if s == "" {
+		return sql.NullString{Valid: false}
+	}
+	return sql.NullString{String: s, Valid: true}
+}
+
+// nullableTime returns a sql.NullTime for database insertion.
+// Zero time values become NULL.
+func nullableTime(t time.Time) sql.NullTime {
+	if t.IsZero() {
+		return sql.NullTime{Valid: false}
+	}
+	return sql.NullTime{Time: t, Valid: true}
+}
+
+// nullableInt64 returns a sql.NullInt64 for database insertion.
+// Nil pointers become NULL.
+func nullableInt64(v *int64) sql.NullInt64 {
+	if v == nil {
+		return sql.NullInt64{Valid: false}
+	}
+	return sql.NullInt64{Int64: *v, Valid: true}
+}
+
+// marshalJSONPtr marshals a pointer value to JSON string, returning empty string for nil pointers.
+// Unlike marshalJSON, this correctly detects nil typed pointers.
+func marshalJSONPtr[T any](v *T) string {
+	if v == nil {
+		return ""
+	}
+	data, err := json.Marshal(v)
+	if err != nil {
+		return ""
+	}
+	return string(data)
+}
+
+// nullableTimePtr returns a *time.Time for scanning nullable timestamps.
+func nullableTimePtr(t sql.NullTime) *time.Time {
+	if !t.Valid {
+		return nil
+	}
+	return &t.Time
+}
+
+// ptrToNullTime converts a *time.Time to sql.NullTime for database insertion.
+// Nil pointers become NULL.
+func ptrToNullTime(t *time.Time) sql.NullTime {
+	if t == nil {
+		return sql.NullTime{Valid: false}
+	}
+	return sql.NullTime{Time: *t, Valid: true}
+}
