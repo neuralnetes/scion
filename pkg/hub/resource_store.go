@@ -206,6 +206,10 @@ func (rs *ResourceStore) Bootstrap(ctx context.Context, name, dir, scope, scopeI
 
 	existing.Files = uploaded
 	existing.ContentHash = newHash
+	// Activate the record now that the upload succeeded. This also recovers a
+	// record left in "pending" by a prior bootstrap that failed mid-upload: the
+	// retry re-syncs and flips it to active rather than leaving it stuck.
+	existing.Status = resourceStatusActive
 	if err := p.Update(ctx, existing, dir); err != nil {
 		return false, err
 	}

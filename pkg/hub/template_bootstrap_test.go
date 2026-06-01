@@ -492,6 +492,52 @@ func TestSyncExistingTemplate_ForceWithoutChangesStillReuploads(t *testing.T) {
 	}
 }
 
+// TestSyncExistingTemplate_ActivatesPendingRecord verifies that a record left
+// in "pending" by a prior bootstrap that failed mid-upload is flipped back to
+// "active" once a later sync re-uploads successfully. Regression test for the
+// PR #288 finding: the existing-resource path never reset Status, so a stranded
+// pending record stayed pending forever.
+func TestSyncExistingTemplate_ActivatesPendingRecord(t *testing.T) {
+	srv, s, _ := testTemplateBootstrapServer(t)
+	ctx := context.Background()
+
+	templatesDir := makeTemplateDir(t, "recover", map[string]string{
+		"only.txt": "content",
+	})
+	templateDir := filepath.Join(templatesDir, "recover")
+
+	if err := srv.bootstrapSingleTemplate(ctx, "recover", templateDir, store.TemplateScopeGlobal, ""); err != nil {
+		t.Fatalf("bootstrap failed: %v", err)
+	}
+
+	// Simulate a record stranded in "pending" by an earlier upload failure.
+	existing, err := s.GetTemplateBySlug(ctx, "recover", store.TemplateScopeGlobal, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	existing.Status = resourceStatusPending
+	if err := s.UpdateTemplate(ctx, existing); err != nil {
+		t.Fatalf("seed pending status: %v", err)
+	}
+	existing, err = s.GetTemplateBySlug(ctx, "recover", store.TemplateScopeGlobal, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A forced re-sync re-uploads and should activate the record.
+	if _, err := srv.syncExistingTemplate(ctx, existing, templateDir, true); err != nil {
+		t.Fatalf("syncExistingTemplate failed: %v", err)
+	}
+
+	got, err := s.GetTemplateBySlug(ctx, "recover", store.TemplateScopeGlobal, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != resourceStatusActive {
+		t.Errorf("expected status %q after successful re-sync, got %q", resourceStatusActive, got.Status)
+	}
+}
+
 // TestSyncExistingTemplate_PopulatesNewHashForLaterAgents verifies that after
 // a forced re-sync, a freshly resolved template (the path used when creating a
 // new agent) carries the updated ContentHash. This is the chain that ensures
