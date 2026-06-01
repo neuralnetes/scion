@@ -69,10 +69,10 @@ const (
 
 // Default circuit breaker configuration values.
 const (
-	DefaultMaxFailures    = 3
-	DefaultOpenDuration   = 60 * time.Second
-	DefaultProbeInterval  = 30 * time.Second
-	DefaultProbeTimeout   = 10 * time.Second
+	DefaultMaxFailures   = 3
+	DefaultOpenDuration  = 60 * time.Second
+	DefaultProbeInterval = 30 * time.Second
+	DefaultProbeTimeout  = 10 * time.Second
 )
 
 // ResilientCloudHandlerConfig configures the circuit breaker behavior.

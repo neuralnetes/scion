@@ -17,8 +17,8 @@ package logging
 import (
 	"context"
 	"errors"
-	"log/slog"
 	"io"
+	"log/slog"
 	"sync/atomic"
 	"testing"
 	"time"
