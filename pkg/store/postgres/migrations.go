@@ -592,33 +592,14 @@ CREATE INDEX IF NOT EXISTS idx_gcp_sa_scope ON gcp_service_accounts(scope, scope
 // Migration V31: Add scope column to notification_subscriptions and make agent_id nullable.
 // Enables project-scoped subscriptions (watch all agents in a project) in addition to
 // agent-scoped subscriptions. Adds unique constraint for deduplication.
+// The SQLite source recreates notification_subscriptions because SQLite cannot
+// ALTER COLUMN to drop NOT NULL. Postgres supports ADD COLUMN and ALTER COLUMN
+// DROP NOT NULL directly, so this is a plain in-place ALTER. Recreating the
+// table with DROP ... CASCADE would silently destroy the notifications
+// .subscription_id foreign key and never recreate it.
 const migrationV31 = `
--- Postgres supports ALTER TABLE directly, so we recreate the table as in SQLite source.
-CREATE TABLE notification_subscriptions_new (
-	id TEXT PRIMARY KEY,
-	scope TEXT NOT NULL DEFAULT 'agent',
-	agent_id TEXT,
-	subscriber_type TEXT NOT NULL DEFAULT 'agent',
-	subscriber_id TEXT NOT NULL,
-	grove_id TEXT NOT NULL,
-	trigger_activities TEXT NOT NULL,
-	created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-	created_by TEXT NOT NULL,
-	FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE
-);
-
--- Copy existing data (all existing subscriptions are agent-scoped)
-INSERT INTO notification_subscriptions_new
-	(id, scope, agent_id, subscriber_type, subscriber_id, grove_id, trigger_activities, created_at, created_by)
-SELECT id, 'agent', agent_id, subscriber_type, subscriber_id, grove_id, trigger_activities, created_at, created_by
-FROM notification_subscriptions;
-
-DROP TABLE notification_subscriptions CASCADE;
-ALTER TABLE notification_subscriptions_new RENAME TO notification_subscriptions;
-
--- Recreate indexes
-CREATE INDEX IF NOT EXISTS idx_notification_subs_agent ON notification_subscriptions(agent_id);
-CREATE INDEX IF NOT EXISTS idx_notification_subs_project ON notification_subscriptions(grove_id);
+ALTER TABLE notification_subscriptions ADD COLUMN IF NOT EXISTS scope TEXT NOT NULL DEFAULT 'agent';
+ALTER TABLE notification_subscriptions ALTER COLUMN agent_id DROP NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_notification_subs_subscriber ON notification_subscriptions(subscriber_type, subscriber_id);
 
 -- Unique constraint: one subscription per (scope, target, subscriber, project)
@@ -751,49 +732,19 @@ CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at DESC);
 `
 
 // Migration V40: Allow multiple groves per git remote (drop UNIQUE on git_remote),
-// and enforce slug uniqueness (add UNIQUE on slug). Requires table recreation
-// because SQLite does not support ALTER TABLE DROP CONSTRAINT.
+// and enforce slug uniqueness (add UNIQUE on slug).
 //
-// IMPORTANT: This migration requires foreign_keys=OFF around the DROP TABLE.
-// SQLite ignores PRAGMA changes inside transactions, so the migration runner
-// handles this via the foreignKeysOffMigrations set. The PRAGMA statements are
-// intentionally NOT included in the SQL string.
+// The SQLite source recreates the whole `groves` table because SQLite cannot
+// ALTER TABLE ... DROP/ADD CONSTRAINT. Postgres supports both directly, so this
+// is a plain in-place ALTER. We deliberately do NOT drop+recreate the table:
+// in Postgres, DROP TABLE ... CASCADE would silently drop every foreign key in
+// other tables (agents, templates, schedules, ...) that references groves(id),
+// and those FKs would never be recreated — corrupting the schema. The inline
+// `git_remote TEXT UNIQUE` from V1 is the auto-named constraint groves_git_remote_key.
 const migrationV40 = `
-CREATE TABLE IF NOT EXISTS groves_new (
-	id TEXT PRIMARY KEY,
-	name TEXT NOT NULL,
-	slug TEXT NOT NULL UNIQUE,
-	git_remote TEXT,
-	labels TEXT,
-	annotations TEXT,
-	created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-	updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-	created_by TEXT,
-	owner_id TEXT,
-	visibility TEXT NOT NULL DEFAULT 'private',
-	default_runtime_broker_id TEXT REFERENCES runtime_brokers(id) ON DELETE SET NULL,
-	shared_dirs TEXT,
-	github_installation_id INTEGER REFERENCES github_installations(installation_id),
-	github_permissions TEXT,
-	github_app_status TEXT,
-	git_identity TEXT
-);
-
-INSERT INTO groves_new SELECT
-	id, name, slug, git_remote, labels, annotations,
-	created_at, updated_at, created_by, owner_id, visibility,
-	default_runtime_broker_id, shared_dirs,
-	github_installation_id, github_permissions, github_app_status,
-	git_identity
-FROM groves ON CONFLICT DO NOTHING;
-
-DROP TABLE IF EXISTS groves CASCADE;
-ALTER TABLE groves_new RENAME TO groves;
-
+ALTER TABLE groves DROP CONSTRAINT IF EXISTS groves_git_remote_key;
+ALTER TABLE groves ADD CONSTRAINT groves_slug_key UNIQUE (slug);
 CREATE INDEX IF NOT EXISTS idx_groves_slug ON groves(slug);
-CREATE INDEX IF NOT EXISTS idx_groves_git_remote ON groves(git_remote);
-CREATE INDEX IF NOT EXISTS idx_groves_owner ON groves(owner_id);
-CREATE INDEX IF NOT EXISTS idx_groves_default_runtime_broker ON groves(default_runtime_broker_id);
 `
 
 // Migration V41: Maintenance operations tables for the admin maintenance panel.

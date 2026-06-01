@@ -306,7 +306,10 @@ func (s *PostgresStore) ListAgents(ctx context.Context, filter store.AgentFilter
 		args = append(args, filter.Phase)
 	}
 	if filter.AncestorID != "" {
-		conditions = append(conditions, fmt.Sprintf("EXISTS (SELECT 1 FROM json_array_elements_text(ancestry::json) AS e(value) WHERE e.value = $%d)", len(args)+1))
+		// Guard against empty-string / NULL ancestry: ''::json raises a type error
+		// in Postgres (SQLite's json_each silently tolerates NULL), so coalesce to
+		// an empty JSON array before expanding it.
+		conditions = append(conditions, fmt.Sprintf("EXISTS (SELECT 1 FROM json_array_elements_text(COALESCE(NULLIF(ancestry, ''), '[]')::json) AS e(value) WHERE e.value = $%d)", len(args)+1))
 		args = append(args, filter.AncestorID)
 	}
 

@@ -36,8 +36,11 @@ func New(connURL string) (*PostgresStore, error) {
 		return nil, fmt.Errorf("failed to open database: %w", err)
 	}
 
-	db.SetMaxOpenConns(4)
-	db.SetMaxIdleConns(4)
+	// SQLite pins this at 1 (single-writer). Postgres is built for concurrent
+	// access, and the whole point of this backend is a horizontally-scaled,
+	// stateless hub — 4 would starve under concurrent load. 25 is a sane default.
+	db.SetMaxOpenConns(25)
+	db.SetMaxIdleConns(25)
 
 	return &PostgresStore{db: db}, nil
 }
@@ -57,8 +60,32 @@ func (s *PostgresStore) Ping(ctx context.Context) error {
 	return s.db.PingContext(ctx)
 }
 
+// advisoryLockID is an arbitrary, stable key for the migration advisory lock.
+// In a stateless, horizontally-scaled hub, multiple replicas may start and run
+// Migrate concurrently; a database-global advisory lock serializes them so only
+// one replica applies migrations while the others wait.
+const advisoryLockID = 0x5C104D16 // "SCIONDB" mnemonic
+
 // Migrate applies database migrations.
 func (s *PostgresStore) Migrate(ctx context.Context) error {
+	// Serialize migrations across replicas with a session-level advisory lock.
+	// The lock and unlock MUST run on the same session, so pin them to a
+	// dedicated connection; the migrations themselves run via the pool — the
+	// lock is database-global and blocks other replicas regardless of which
+	// connection runs the DDL.
+	lockConn, err := s.db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to acquire connection for migration lock: %w", err)
+	}
+	defer lockConn.Close()
+	if _, err := lockConn.ExecContext(ctx, "SELECT pg_advisory_lock($1)", advisoryLockID); err != nil {
+		return fmt.Errorf("failed to acquire migration advisory lock: %w", err)
+	}
+	defer func() {
+		// Best-effort unlock; closing the connection also releases the lock.
+		_, _ = lockConn.ExecContext(ctx, "SELECT pg_advisory_unlock($1)", advisoryLockID)
+	}()
+
 	migrations := []any{
 		migrationV1,
 		migrationV2,
@@ -127,18 +154,17 @@ func (s *PostgresStore) Migrate(ctx context.Context) error {
 
 	// Get current version
 	var currentVersion int
-	err := s.db.QueryRowContext(ctx, "SELECT COALESCE(MAX(version), 0) FROM schema_migrations").Scan(&currentVersion)
+	err = s.db.QueryRowContext(ctx, "SELECT COALESCE(MAX(version), 0) FROM schema_migrations").Scan(&currentVersion)
 	if err != nil {
 		return fmt.Errorf("failed to get current schema version: %w", err)
 	}
 
-	// Migrations that require PRAGMA foreign_keys=OFF around the transaction.
-	// SQLite ignores PRAGMA changes inside transactions, so we must disable
-	// foreign keys before BeginTx and re-enable after Commit. Without this,
-	// DROP TABLE on a parent table triggers ON DELETE CASCADE on child tables.
-	foreignKeysOffMigrations := map[int]bool{
-		40: true, // V40 drops and recreates the projects table
-	}
+	// In SQLite these migrations need PRAGMA foreign_keys=OFF because they
+	// recreate a parent table (DROP + rename), which would otherwise cascade.
+	// The Postgres translations use in-place ALTER TABLE instead, so none
+	// actually need special handling — the map is kept (empty) plus
+	// applyMigrationWithFKOff so the runner shape stays 1-to-1 with SQLite.
+	foreignKeysOffMigrations := map[int]bool{}
 
 	// Apply pending migrations
 	for i, migration := range migrations {
