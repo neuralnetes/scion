@@ -48,7 +48,7 @@ func (s *PostgresStore) CreateHarnessConfig(ctx context.Context, hc *store.Harne
 		hc.Harness, marshalJSON(hc.Config),
 		nullableString(hc.ContentHash), hc.Scope, nullableString(hc.ScopeID),
 		nullableString(hc.StorageURI), nullableString(hc.StorageBucket), nullableString(hc.StoragePath), marshalJSON(hc.Files),
-		hc.Locked, hc.Status,
+		boolToInt(hc.Locked), hc.Status,
 		nullableString(hc.OwnerID), nullableString(hc.CreatedBy), nullableString(hc.UpdatedBy), hc.Visibility,
 		hc.Created, hc.Updated,
 	)
@@ -168,7 +168,7 @@ func (s *PostgresStore) UpdateHarnessConfig(ctx context.Context, hc *store.Harne
 		hc.Harness, marshalJSON(hc.Config),
 		nullableString(hc.ContentHash), hc.Scope, nullableString(hc.ScopeID),
 		nullableString(hc.StorageURI), nullableString(hc.StorageBucket), nullableString(hc.StoragePath), marshalJSON(hc.Files),
-		hc.Locked, hc.Status,
+		boolToInt(hc.Locked), hc.Status,
 		nullableString(hc.OwnerID), nullableString(hc.UpdatedBy), hc.Visibility,
 		hc.Updated,
 		hc.ID,

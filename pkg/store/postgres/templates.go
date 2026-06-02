@@ -53,7 +53,7 @@ func (s *PostgresStore) CreateTemplate(ctx context.Context, template *store.Temp
 		template.Harness, nullableString(template.DefaultHarnessConfig), template.Image, marshalJSON(template.Config),
 		nullableString(template.ContentHash), template.Scope, nullableString(template.ScopeID), nullableString(template.ProjectID),
 		nullableString(template.StorageURI), nullableString(template.StorageBucket), nullableString(template.StoragePath), marshalJSON(template.Files),
-		nullableString(template.BaseTemplate), template.Locked, template.Status,
+		nullableString(template.BaseTemplate), boolToInt(template.Locked), template.Status,
 		nullableString(template.OwnerID), nullableString(template.CreatedBy), nullableString(template.UpdatedBy), template.Visibility,
 		template.Created, template.Updated,
 	)
@@ -186,7 +186,7 @@ func (s *PostgresStore) UpdateTemplate(ctx context.Context, template *store.Temp
 		template.Harness, nullableString(template.DefaultHarnessConfig), template.Image, marshalJSON(template.Config),
 		nullableString(template.ContentHash), template.Scope, nullableString(template.ScopeID), nullableString(template.ProjectID),
 		nullableString(template.StorageURI), nullableString(template.StorageBucket), nullableString(template.StoragePath), marshalJSON(template.Files),
-		nullableString(template.BaseTemplate), template.Locked, template.Status,
+		nullableString(template.BaseTemplate), boolToInt(template.Locked), template.Status,
 		nullableString(template.OwnerID), nullableString(template.UpdatedBy), template.Visibility,
 		template.Updated,
 		template.ID,
