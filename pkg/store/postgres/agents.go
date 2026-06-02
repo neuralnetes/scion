@@ -466,7 +466,7 @@ func (s *PostgresStore) UpdateAgentStatus(ctx context.Context, id string, su sto
 			last_activity_event = CASE WHEN $13 != '' THEN $14 ELSE last_activity_event END,
 			current_turns = CASE WHEN $15 THEN $16 ELSE current_turns END,
 			current_model_calls = CASE WHEN $17 THEN $18 ELSE current_model_calls END,
-			started_at = COALESCE(NULLIF($19, ''), started_at),
+			started_at = COALESCE(NULLIF($19, '')::timestamp, started_at),
 			updated_at = $20,
 			last_seen = $21
 		WHERE id = $22
