@@ -23,6 +23,7 @@ import (
 	"io"
 	"log"
 	"log/slog"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -693,7 +694,26 @@ func initStore(cfg *config.GlobalConfig) (store.Store, error) {
 			return nil, fmt.Errorf("failed to run migrations: %w", err)
 		}
 
-		entClient, err := entc.OpenPostgres(cfg.Database.URL)
+		// Isolate the Ent-managed tables from the raw-store tables. On SQLite
+		// these two table sets live in physically separate database files
+		// (entDSN := cfg.Database.URL + "_ent" above); several tables exist in
+		// both worlds with deliberately different column types — e.g. the raw
+		// migrations create projects.id as TEXT while the Ent schema models it
+		// as UUID. Pointing Ent at the same Postgres schema as the raw store
+		// makes Ent's auto-migration try to ALTER those shared tables in place
+		// ("column \"id\" cannot be cast automatically to type uuid"). A
+		// dedicated `ent` schema is the Postgres analog of the separate _ent
+		// file, keeping the two table sets from colliding.
+		if _, err := pgStore.DB().ExecContext(context.Background(), "CREATE SCHEMA IF NOT EXISTS ent"); err != nil {
+			pgStore.Close()
+			return nil, fmt.Errorf("failed to create ent schema: %w", err)
+		}
+		entDSN, err := withSearchPath(cfg.Database.URL, "ent")
+		if err != nil {
+			pgStore.Close()
+			return nil, fmt.Errorf("failed to build ent DSN: %w", err)
+		}
+		entClient, err := entc.OpenPostgres(entDSN)
 		if err != nil {
 			pgStore.Close()
 			return nil, fmt.Errorf("failed to open ent database: %w", err)
@@ -717,6 +737,37 @@ func initStore(cfg *config.GlobalConfig) (store.Store, error) {
 	default:
 		return nil, fmt.Errorf("unsupported database driver: %s", cfg.Database.Driver)
 	}
+}
+
+// withSearchPath returns the Postgres DSN with its connection search_path
+// pinned to schemaName, so an Ent client opened on it confines all of its
+// tables to that schema. It understands both DSN flavors lib/pq accepts: a
+// URL form ("postgres://user:pass@host/db?...") and the keyword/value form
+// ("host=... dbname=..."). For the URL form the schema is set via the
+// `options` query parameter (-c search_path=...); for the keyword form an
+// `options` keyword is appended. An existing search_path/options is replaced.
+func withSearchPath(dsn, schemaName string) (string, error) {
+	opt := "-c search_path=" + schemaName
+	if strings.HasPrefix(dsn, "postgres://") || strings.HasPrefix(dsn, "postgresql://") {
+		u, err := url.Parse(dsn)
+		if err != nil {
+			return "", fmt.Errorf("parsing postgres URL: %w", err)
+		}
+		q := u.Query()
+		q.Set("options", opt)
+		u.RawQuery = q.Encode()
+		return u.String(), nil
+	}
+	// Keyword/value DSN: drop any existing options token, then append ours.
+	fields := make([]string, 0)
+	for _, f := range strings.Fields(dsn) {
+		if strings.HasPrefix(f, "options=") {
+			continue
+		}
+		fields = append(fields, f)
+	}
+	fields = append(fields, "options='"+opt+"'")
+	return strings.Join(fields, " "), nil
 }
 
 // initDevAuth initializes dev authentication and returns the token.
