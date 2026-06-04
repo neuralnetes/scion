@@ -1253,7 +1253,7 @@ func (ws *WebServer) handleOAuthLogin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Validate provider
-	if provider != "google" && provider != "github" {
+	if provider != "google" && provider != "github" && provider != "generic" {
 		http.Error(w, "unsupported OAuth provider", http.StatusBadRequest)
 		return
 	}
@@ -1310,7 +1310,7 @@ func (ws *WebServer) handleOAuthCallback(w http.ResponseWriter, r *http.Request)
 	provider := strings.TrimPrefix(r.URL.Path, "/auth/callback/")
 	provider = strings.TrimSuffix(provider, "/")
 
-	if provider != "google" && provider != "github" {
+	if provider != "google" && provider != "github" && provider != "generic" {
 		http.Error(w, "unsupported OAuth provider", http.StatusBadRequest)
 		return
 	}
