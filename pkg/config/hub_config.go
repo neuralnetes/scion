@@ -254,6 +254,16 @@ type OAuthProviderConfig struct {
 	ClientID string `json:"clientId" yaml:"clientId" koanf:"clientId"`
 	// ClientSecret is the OAuth application client secret.
 	ClientSecret string `json:"clientSecret" yaml:"clientSecret" koanf:"clientSecret"`
+	// The following fields are only used by the generic OAuth/OIDC provider
+	// (e.g. Dex); field names mirror Better Auth's genericOAuth config. Set
+	// DiscoveryURL or Issuer for OIDC discovery, or set the endpoints
+	// explicitly. Left empty for Google/GitHub.
+	DiscoveryURL     string `json:"discoveryUrl" yaml:"discoveryUrl" koanf:"discoveryUrl"`
+	Issuer           string `json:"issuer" yaml:"issuer" koanf:"issuer"`
+	AuthorizationURL string `json:"authorizationUrl" yaml:"authorizationUrl" koanf:"authorizationUrl"`
+	TokenURL         string `json:"tokenUrl" yaml:"tokenUrl" koanf:"tokenUrl"`
+	UserInfoURL      string `json:"userInfoUrl" yaml:"userInfoUrl" koanf:"userInfoUrl"`
+	Scopes           string `json:"scopes" yaml:"scopes" koanf:"scopes"`
 }
 
 // OAuthClientConfig holds OAuth provider configurations for a specific client type.
@@ -262,6 +272,10 @@ type OAuthClientConfig struct {
 	Google OAuthProviderConfig `json:"google" yaml:"google" koanf:"google"`
 	// GitHub OAuth settings for this client type.
 	GitHub OAuthProviderConfig `json:"github" yaml:"github" koanf:"github"`
+	// Generic is a configurable OAuth2/OIDC provider (e.g. Dex) for this client
+	// type. Configure via SCION_SERVER_OAUTH_<CLIENT>_GENERIC_{CLIENTID,CLIENTSECRET}
+	// plus GENERIC_ISSUER (discovery) or explicit GENERIC_{AUTHURL,TOKENURL,USERINFOURL}.
+	Generic OAuthProviderConfig `json:"generic" yaml:"generic" koanf:"generic"`
 }
 
 // OAuthConfig holds OAuth provider configurations.

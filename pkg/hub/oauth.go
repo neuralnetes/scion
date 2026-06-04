@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/hubclient"
@@ -31,17 +32,32 @@ import (
 type OAuthProviderConfig struct {
 	ClientID     string
 	ClientSecret string
+	// The following fields are only used by the generic OAuth/OIDC provider
+	// (Google/GitHub leave them empty). Field names mirror Better Auth's
+	// genericOAuth config. Endpoints resolve in this order: explicit
+	// AuthorizationURL/TokenURL/UserInfoURL win; else OIDC discovery against
+	// DiscoveryURL; else discovery derived from Issuer
+	// (Issuer + "/.well-known/openid-configuration").
+	DiscoveryURL     string // full .well-known/openid-configuration URL
+	Issuer           string // issuer identifier; also derives DiscoveryURL when that is unset
+	AuthorizationURL string
+	TokenURL         string
+	UserInfoURL      string
+	Scopes           string // space-separated; defaults to "openid email profile"
 }
 
 // OAuthClientConfig holds OAuth provider configurations for a specific client type.
 type OAuthClientConfig struct {
 	Google OAuthProviderConfig
 	GitHub OAuthProviderConfig
+	// Generic is a configurable OAuth2/OIDC provider (e.g. Dex) — discovery via
+	// Issuer, or explicit AuthURL/TokenURL/UserInfoURL.
+	Generic OAuthProviderConfig
 }
 
 // IsConfigured returns true if at least one OAuth provider is configured.
 func (c *OAuthClientConfig) IsConfigured() bool {
-	return c.Google.ClientID != "" || c.GitHub.ClientID != ""
+	return c.Google.ClientID != "" || c.GitHub.ClientID != "" || c.Generic.ClientID != ""
 }
 
 // IsProviderConfigured returns true if the specified provider is configured.
@@ -51,6 +67,12 @@ func (c *OAuthClientConfig) IsProviderConfigured(provider string) bool {
 		return c.Google.ClientID != "" && c.Google.ClientSecret != ""
 	case hubclient.OAuthProviderGitHub:
 		return c.GitHub.ClientID != "" && c.GitHub.ClientSecret != ""
+	case hubclient.OAuthProviderGeneric:
+		// Needs credentials plus a way to resolve endpoints: a discovery URL or
+		// issuer (for discovery), or explicit authorize+token endpoints.
+		hasEndpoints := c.Generic.DiscoveryURL != "" || c.Generic.Issuer != "" ||
+			(c.Generic.AuthorizationURL != "" && c.Generic.TokenURL != "")
+		return c.Generic.ClientID != "" && c.Generic.ClientSecret != "" && hasEndpoints
 	default:
 		return false
 	}
@@ -63,6 +85,8 @@ func (c *OAuthClientConfig) GetProvider(provider string) OAuthProviderConfig {
 		return c.Google
 	case hubclient.OAuthProviderGitHub:
 		return c.GitHub
+	case hubclient.OAuthProviderGeneric:
+		return c.Generic
 	default:
 		return OAuthProviderConfig{}
 	}
@@ -110,6 +134,10 @@ func oauthProviderOrder() []string {
 type OAuthService struct {
 	config     OAuthConfig
 	httpClient *http.Client
+
+	// oidcCache memoizes OIDC discovery documents keyed by issuer URL.
+	oidcMu    sync.RWMutex
+	oidcCache map[string]*oidcDiscovery
 }
 
 // NewOAuthService creates a new OAuth service.
@@ -119,6 +147,7 @@ func NewOAuthService(config OAuthConfig) *OAuthService {
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
 		},
+		oidcCache: make(map[string]*oidcDiscovery),
 	}
 }
 
@@ -212,6 +241,8 @@ func (s *OAuthService) GetAuthorizationURLForClient(clientType OAuthClientType, 
 		return s.getGoogleAuthURLWithConfig(cfg.Google, callbackURL, state)
 	case hubclient.OAuthProviderGitHub:
 		return s.getGitHubAuthURLWithConfig(cfg.GitHub, callbackURL, state)
+	case hubclient.OAuthProviderGeneric:
+		return s.getGenericAuthURLWithConfig(cfg.Generic, callbackURL, state)
 	default:
 		return "", fmt.Errorf("unsupported OAuth provider: %s", provider)
 	}
@@ -278,6 +309,8 @@ func (s *OAuthService) ExchangeCodeForClient(ctx context.Context, clientType OAu
 		return s.exchangeGoogleCodeWithConfig(ctx, cfg.Google, code, callbackURL)
 	case "github":
 		return s.exchangeGitHubCodeWithConfig(ctx, cfg.GitHub, code, callbackURL)
+	case hubclient.OAuthProviderGeneric:
+		return s.exchangeGenericCodeWithConfig(ctx, cfg.Generic, code, callbackURL)
 	default:
 		return nil, fmt.Errorf("unsupported OAuth provider: %s", provider)
 	}
