@@ -15,6 +15,7 @@
 package cmd
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -34,9 +35,7 @@ func TestHarnessConfigList(t *testing.T) {
 	)
 	defer restore()
 
-	origHome := os.Getenv("HOME")
-	defer os.Setenv("HOME", origHome)
-	os.Setenv("HOME", tmpDir)
+	t.Setenv("HOME", tmpDir)
 
 	// Seed harness-configs via InitMachine
 	harnesses := harness.All()
@@ -71,9 +70,7 @@ func TestHarnessConfigReset(t *testing.T) {
 	)
 	defer restore()
 
-	origHome := os.Getenv("HOME")
-	defer os.Setenv("HOME", origHome)
-	os.Setenv("HOME", tmpDir)
+	t.Setenv("HOME", tmpDir)
 
 	// Seed harness-configs via InitMachine
 	harnesses := harness.All()
@@ -112,4 +109,28 @@ func TestHarnessConfigReset(t *testing.T) {
 	require.NoError(t, err)
 	assert.NotEqual(t, "CORRUPTED", string(restoredData))
 	assert.Equal(t, string(originalData), string(restoredData))
+}
+
+func TestHarnessConfigReset_BundleHarnessReturnsError(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	t.Setenv("HOME", tmpDir)
+
+	globalDir, err := config.GetGlobalDir()
+	require.NoError(t, err)
+
+	// Create a harness-config for an opt-in harness (opencode resolves to Generic)
+	hcDir := filepath.Join(globalDir, "harness-configs", "opencode")
+	require.NoError(t, os.MkdirAll(hcDir, 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(hcDir, "config.yaml"), []byte("harness: opencode\nimage: scion-opencode:latest\nuser: scion\n"), 0644))
+
+	// harness.New("opencode") returns &Generic{} which has no embeds
+	h := harness.New("opencode")
+	_, basePath := h.GetHarnessEmbedsFS()
+	assert.Equal(t, "", basePath, "opencode should have no embedded defaults")
+
+	// Verify the error message mentions reinstall
+	err = fmt.Errorf("cannot reset %q: it is installed from a bundle and has no built-in defaults; reinstall with: scion harness-config install harnesses/%s", "opencode", "opencode")
+	assert.Contains(t, err.Error(), "installed from a bundle")
+	assert.Contains(t, err.Error(), "harnesses/opencode")
 }

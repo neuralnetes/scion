@@ -24,10 +24,6 @@ func New(harnessName string) api.Harness {
 		return &ClaudeCode{}
 	case "gemini":
 		return &GeminiCLI{}
-	case "opencode":
-		return &OpenCode{}
-	case "codex":
-		return &Codex{}
 	default:
 		return &Generic{}
 	}
@@ -37,7 +33,5 @@ func All() []api.Harness {
 	return []api.Harness{
 		&GeminiCLI{},
 		&ClaudeCode{},
-		&OpenCode{},
-		&Codex{},
 	}
 }
