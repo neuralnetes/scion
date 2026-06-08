@@ -550,7 +550,8 @@ type Server struct {
 	authzService           *AuthzService           // Authorization service for policy evaluation
 	events                 EventPublisher          // Event publisher for real-time SSE updates
 	commandBus             CommandBus              // Inter-node dispatch signal bus (nil-safe; nil = no-op)
-	notificationDispatcher *NotificationDispatcher // Notification dispatcher for agent status events
+	notificationDispatcher   *NotificationDispatcher   // Notification dispatcher for agent status events
+	lifecycleHookEvaluator   *LifecycleHookEvaluator   // Lifecycle hook evaluator for agent phase transitions
 	// reconcile op executors (seams): default to executeDispatch/deliverMessage;
 	// Phase 3/4 supply the real local-tunnel ops; tests override for exactly-once.
 	execDispatch     func(ctx context.Context, d store.BrokerDispatch) (string, error)
@@ -1533,6 +1534,41 @@ func (s *Server) StartNotificationDispatcher() {
 	s.notificationDispatcher.Start()
 }
 
+// StartLifecycleHookEvaluator creates and starts the lifecycle hook evaluator
+// if a subscription-capable EventPublisher is available. The evaluator listens
+// for authoritative agent phase transitions and fires matching lifecycle hooks
+// asynchronously — it never blocks or aborts a transition.
+// Safe to call multiple times; subsequent calls are no-ops.
+func (s *Server) StartLifecycleHookEvaluator(opts ...EvaluatorOption) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.lifecycleHookEvaluator != nil {
+		return // already started
+	}
+
+	if _, isNoop := s.events.(noopEventPublisher); isNoop || s.events == nil {
+		slog.Warn("Event publisher does not support subscriptions, lifecycle hook evaluator not started")
+		return
+	}
+
+	// In multi-instance HA the active publisher is *PostgresEventPublisher,
+	// which broadcasts every transition to ALL hub instances. With the in-memory
+	// deduper each instance would fire the hook independently (duplicate
+	// register/deregister), so the broadcast publisher MUST use the durable
+	// store-backed CAS deduper. Select it from the publisher type; explicit
+	// caller opts still take precedence (they are applied last).
+	allOpts := opts
+	if driver := deduperDriverForPublisher(s.events); driver != "" {
+		allOpts = append([]EvaluatorOption{WithDBDriver(driver)}, opts...)
+	}
+
+	executor := NewHTTPExecutor(s.store, s.gcpTokenGenerator, s.auditLogger, logging.Subsystem("hub.lifecycle-hooks.executor"))
+	ev := NewLifecycleHookEvaluator(s.store, s.events, executor, logging.Subsystem("hub.lifecycle-hooks"), allOpts...)
+	s.lifecycleHookEvaluator = ev
+	s.lifecycleHookEvaluator.Start()
+}
+
 // StartMessageBroker creates and starts the message broker proxy if a
 // subscription-capable EventPublisher is available. The broker enables pub/sub message
 // routing with topic-based subscriptions and broadcast fan-out.
@@ -2200,6 +2236,11 @@ func (s *Server) StartBackgroundServices(ctx context.Context) {
 	// The dispatcher is resolved lazily so it works even if SetDispatcher
 	// is called after Start().
 	s.StartNotificationDispatcher()
+
+	// Start lifecycle hook evaluator (uses the current event publisher).
+	// The evaluator detects postgres from the EventPublisher type for
+	// backend-aware deduplication; callers may also pass WithDBDriver.
+	s.StartLifecycleHookEvaluator()
 }
 
 func (s *Server) Start(ctx context.Context) error {
@@ -2274,6 +2315,11 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		s.notificationDispatcher.Stop()
 	}
 
+	// Stop lifecycle hook evaluator before closing event publisher
+	if s.lifecycleHookEvaluator != nil {
+		s.lifecycleHookEvaluator.Stop()
+	}
+
 	// Close event publisher
 	if s.events != nil {
 		s.events.Close()
@@ -2310,6 +2356,9 @@ func (s *Server) CleanupResources(ctx context.Context) error {
 		}
 		if s.notificationDispatcher != nil {
 			s.notificationDispatcher.Stop()
+		}
+		if s.lifecycleHookEvaluator != nil {
+			s.lifecycleHookEvaluator.Stop()
 		}
 		if s.messageBrokerProxy != nil {
 			s.messageBrokerProxy.Stop()
@@ -2432,6 +2481,8 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/api/v1/admin/server-config", s.handleAdminServerConfig)
 	s.mux.HandleFunc("/api/v1/admin/agents/reset-auth-all", s.handleAdminResetAuthAll)
 	s.mux.HandleFunc("/api/v1/admin/gcp-quota", s.handleAdminGCPQuota)
+	s.mux.HandleFunc("/api/v1/admin/lifecycle-hooks", s.handleAdminLifecycleHooks)
+	s.mux.HandleFunc("/api/v1/admin/lifecycle-hooks/", s.handleAdminLifecycleHookByID)
 
 	// Notification endpoints (user-facing)
 	s.mux.HandleFunc("/api/v1/notifications", s.handleNotifications)
