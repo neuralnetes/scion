@@ -68,8 +68,12 @@ func (nd *NotificationDispatcher) SetBrokerProxy(p *MessageBrokerProxy) {
 
 // Start subscribes to agent status and deletion events and spawns goroutines to process them.
 func (nd *NotificationDispatcher) Start() {
-	statusCh, unsubStatus := nd.events.Subscribe("project.>.agent.status")
-	deletedCh, unsubDeleted := nd.events.Subscribe("project.>.agent.deleted")
+	// '*' (single token), not '>': '>' only matches the remainder of a
+	// subject, so a mid-pattern '>' would swallow every project.* event —
+	// broker.status, project.deleted, user.message — whose payloads have no
+	// agentId and blow up downstream UUID lookups.
+	statusCh, unsubStatus := nd.events.Subscribe("project.*.agent.status")
+	deletedCh, unsubDeleted := nd.events.Subscribe("project.*.agent.deleted")
 
 	nd.wg.Add(1)
 	go func() {
