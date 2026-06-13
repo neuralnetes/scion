@@ -428,21 +428,16 @@ func buildCommonRunArgs(config RunConfig) ([]string, error) {
 
 	// Get command from harness
 	var harnessArgs []string
-	if config.Harness != nil {
-		harnessArgs = config.Harness.GetCommand(config.Task, config.Resume, config.CommandArgs)
-	} else {
-		return nil, fmt.Errorf("no harness provided")
-	}
-
-	// When NoAuth is set, drop to a shell instead of launching the harness CLI.
-	// TODO: Only drop-to-shell is currently implemented. show-setup-instructions
-	// and run-setup-wizard are defined in config but not yet handled.
 	if config.NoAuth {
 		if config.NoAuthMessage != "" {
-			harnessArgs = []string{"sh", "-c", fmt.Sprintf("echo %s; exec bash", shellQuote(config.NoAuthMessage))}
+			harnessArgs = []string{"sh", "-c", fmt.Sprintf("printf '%%s\\n' %s; exec bash", shellQuote(config.NoAuthMessage))}
 		} else {
 			harnessArgs = []string{"bash"}
 		}
+	} else if config.Harness != nil {
+		harnessArgs = config.Harness.GetCommand(config.Task, config.Resume, config.CommandArgs)
+	} else {
+		return nil, fmt.Errorf("no harness provided")
 	}
 
 	// Build tmux-wrapped command — use POSIX single-quote escaping so that

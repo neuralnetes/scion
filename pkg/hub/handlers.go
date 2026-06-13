@@ -9452,6 +9452,10 @@ func (s *Server) buildAppliedConfig(req CreateAgentRequest, harnessConfig string
 		ac.InlineConfig = req.Config
 	}
 
+	if ac.HarnessAuth == "none" {
+		ac.NoAuth = true
+	}
+
 	return ac
 }
 
