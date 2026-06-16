@@ -28,7 +28,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/google/uuid"
@@ -158,7 +157,7 @@ func runServerStart(cmd *cobra.Command, args []string) error {
 	defer cancel()
 
 	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	signal.Notify(sigCh, os.Interrupt)
 
 	go func() {
 		sig := <-sigCh
@@ -197,6 +196,9 @@ func runServerStart(cmd *cobra.Command, args []string) error {
 		devAuthToken, err = initDevAuth(cfg, globalDir)
 		if err != nil {
 			return err
+		}
+		if hostedMode {
+			log.Println("WARNING: Development authentication enabled - not for production use")
 		}
 	}
 
@@ -476,7 +478,7 @@ func runServerStart(cmd *cobra.Command, args []string) error {
 			log.Printf("Web UI: http://%s:%d", displayHost, webPort)
 		}
 		if devAuthToken != "" {
-			log.Printf("Dev token: export SCION_DEV_TOKEN=%s", devAuthToken)
+			log.Printf("Developer token: export SCION_DEV_TOKEN=%s", devAuthToken)
 		}
 	}
 
@@ -843,8 +845,7 @@ func initDevAuth(cfg *config.GlobalConfig, globalDir string) (string, error) {
 	os.Setenv("SCION_DEV_TOKEN", devAuthToken)
 	os.Setenv("SCION_AUTH_TOKEN", devAuthToken)
 
-	log.Println("WARNING: Development authentication enabled - not for production use")
-	log.Printf("Dev token: %s", devAuthToken)
+	log.Printf("Developer token: %s", devAuthToken)
 	log.Printf("To authenticate CLI commands, run:")
 	log.Printf("  export SCION_DEV_TOKEN=%s", devAuthToken)
 
@@ -964,9 +965,15 @@ func initHubServer(ctx context.Context, cfg *config.GlobalConfig, s store.Store,
 		SoftDeleteRetainFiles: cfg.Hub.SoftDeleteRetainFiles,
 		AdminMode:             adminMode,
 		MaintenanceMessage:    maintenanceMessage,
-		TelemetryDefault:      cfg.TelemetryEnabled,
-		TelemetryConfig:       config.ConvertV1TelemetryToAPI(cfg.TelemetryConfig),
-		BrokerAuthConfig:      hub.DefaultBrokerAuthConfig(),
+		Workstation:           !hostedMode,
+		DevUserConfig: hub.DevUserConfig{
+			Username:    cfg.Auth.Username,
+			DisplayName: cfg.Auth.DisplayName,
+			Email:       cfg.Auth.Email,
+		},
+		TelemetryDefault: cfg.TelemetryEnabled,
+		TelemetryConfig:  config.ConvertV1TelemetryToAPI(cfg.TelemetryConfig),
+		BrokerAuthConfig: hub.DefaultBrokerAuthConfig(),
 		GitHubAppConfig: hub.GitHubAppServerConfig{
 			AppID:           cfg.GitHubApp.AppID,
 			PrivateKeyPath:  cfg.GitHubApp.PrivateKeyPath,

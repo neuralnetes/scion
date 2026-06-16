@@ -25,6 +25,7 @@ import (
 
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
 	"github.com/GoogleCloudPlatform/scion/pkg/daemon"
+	"github.com/GoogleCloudPlatform/scion/pkg/util"
 	"github.com/spf13/cobra"
 )
 
@@ -46,6 +47,15 @@ func runServerStartOrDaemon(cmd *cobra.Command, args []string) error {
 	if running {
 		return fmt.Errorf("server is already running (PID: %d)\n\nUse 'scion server stop' to stop it, or check the log at %s",
 			pid, daemon.GetLogPathComponent(serverDaemonComponent, globalDir))
+	}
+
+	// Check for phantom processes holding server ports even without a PID file
+	serverPorts := collectServerPorts(cmd)
+	if phantomPorts := daemon.DetectOccupiedPorts(serverPorts); len(phantomPorts) > 0 {
+		fmt.Fprintf(os.Stderr, "Error: the following ports are already in use: %v\n", phantomPorts)
+		fmt.Fprintf(os.Stderr, "A previous server process may be running without a PID file.\n")
+		fmt.Fprintf(os.Stderr, "Run 'scion server stop --force' to kill any process on these ports.\n")
+		return fmt.Errorf("port conflict: ports %v are occupied", phantomPorts)
 	}
 
 	// Check if hosted mode is set in config (settings.yaml server.mode).
@@ -123,6 +133,11 @@ func runServerStartOrDaemon(cmd *cobra.Command, args []string) error {
 		daemonArgs = append(daemonArgs, "--global")
 	}
 
+	// Capture onboarding state BEFORE starting the daemon — the child process
+	// calls InitGlobal() on startup which creates settings.yaml, so checking
+	// afterwards would always see the file as present.
+	needsOnboarding := !hostedMode && config.GetSettingsPath(globalDir) == ""
+
 	// Start daemon
 	mode := "workstation"
 	if hostedMode {
@@ -152,7 +167,7 @@ func runServerStartOrDaemon(cmd *cobra.Command, args []string) error {
 
 	// Print quickstart info for workstation mode
 	if !hostedMode {
-		printWorkstationQuickstart(globalDir, hubHost, webPort, enableWeb, enableDevAuth)
+		printWorkstationQuickstart(needsOnboarding, globalDir, hubHost, webPort, enableWeb, enableDevAuth)
 	}
 
 	fmt.Println("Use 'scion server stop' to stop the daemon.")
@@ -168,6 +183,11 @@ func runServerStop(cmd *cobra.Command, args []string) error {
 	}
 
 	running, pid, _ := daemon.StatusComponent(serverDaemonComponent, globalDir)
+
+	if stopForce {
+		return runServerStopForce(globalDir, running, pid)
+	}
+
 	if !running {
 		return fmt.Errorf("server daemon is not running")
 	}
@@ -186,6 +206,49 @@ func runServerStop(cmd *cobra.Command, args []string) error {
 	}
 
 	fmt.Println("Server daemon stopped.")
+	return nil
+}
+
+func runServerStopForce(globalDir string, pidRunning bool, pid int) error {
+	killed := false
+
+	// If PID file exists and process is running, stop it normally first.
+	if pidRunning {
+		fmt.Printf("Stopping server daemon (PID: %d)...\n", pid)
+		if err := daemon.StopComponent(serverDaemonComponent, globalDir); err == nil {
+			time.Sleep(500 * time.Millisecond)
+			killed = true
+		}
+	}
+
+	// Probe default server ports and kill any process holding them.
+	ports := []int{8080, 9800, 9810}
+	occupied := daemon.DetectOccupiedPorts(ports)
+	if len(occupied) == 0 && !killed {
+		fmt.Println("No running server found.")
+		return nil
+	}
+
+	for _, port := range occupied {
+		killedPID, err := daemon.ForceKillPort(port)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to kill process on port %d: %v\n", port, err)
+			continue
+		}
+		if killedPID > 0 {
+			fmt.Printf("Killed process %d on port %d\n", killedPID, port)
+			killed = true
+		}
+	}
+
+	// Clean up stale PID file
+	_ = daemon.RemovePIDComponent(serverDaemonComponent, globalDir)
+
+	if killed {
+		fmt.Println("Server stopped (forced).")
+	} else {
+		fmt.Println("No running server found.")
+	}
 	return nil
 }
 
@@ -359,14 +422,29 @@ func runServerStatus(cmd *cobra.Command, args []string) error {
 }
 
 // printWorkstationQuickstart prints the first-run quickstart information
-// including the dev token and web UI URL after a workstation-mode daemon starts.
-func printWorkstationQuickstart(globalDir string, host string, wPort int, webEnabled, devAuth bool) {
+// including the developer token and web UI URL after a workstation-mode daemon starts.
+// When the machine hasn't been onboarded yet, it prints and opens the /onboarding URL.
+func printWorkstationQuickstart(needsOnboarding bool, globalDir string, host string, wPort int, webEnabled, devAuth bool) {
 	if webEnabled {
 		displayHost := host
 		if displayHost == "0.0.0.0" || displayHost == "" {
 			displayHost = "127.0.0.1"
 		}
-		fmt.Printf("Web UI:  http://%s:%d\n", displayHost, wPort)
+
+		// Point to /onboarding when the machine hadn't been set up before daemon start.
+		// This state is captured before the daemon launches (which auto-creates settings.yaml).
+		path := ""
+		if needsOnboarding {
+			path = "/onboarding"
+		}
+
+		url := fmt.Sprintf("http://%s:%d%s", displayHost, wPort, path)
+		fmt.Printf("Web UI:  %s\n", url)
+
+		// Auto-open the browser in interactive terminals
+		if os.Getenv("SCION_NO_BROWSER") == "" && util.IsTerminal() && !util.IsHeadlessEnvironment() {
+			_ = util.OpenBrowser(url)
+		}
 	}
 
 	if devAuth {
@@ -376,10 +454,27 @@ func printWorkstationQuickstart(globalDir string, host string, wPort int, webEna
 			token := strings.TrimSpace(string(data))
 			if token != "" {
 				fmt.Println()
-				fmt.Println("Dev token (for CLI authentication):")
+				fmt.Println("Developer token (for CLI authentication):")
 				fmt.Printf("  export SCION_DEV_TOKEN=%s\n", token)
 			}
 		}
 	}
 	fmt.Println()
+}
+
+// collectServerPorts returns the list of TCP ports the server would bind based
+// on the flags the user passed (or their defaults).
+func collectServerPorts(cmd *cobra.Command) []int {
+	seen := map[int]bool{}
+	var ports []int
+	add := func(p int) {
+		if !seen[p] {
+			seen[p] = true
+			ports = append(ports, p)
+		}
+	}
+	add(webPort)
+	add(hubPort)
+	add(runtimeBrokerPort)
+	return ports
 }

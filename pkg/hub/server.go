@@ -31,6 +31,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/agent/state"
@@ -178,6 +179,11 @@ type ServerConfig struct {
 	// TransportMinter mints transport-layer OIDC tokens for agents.
 	// Nil when TransportMode == "none" or unset.
 	TransportMinter TransportTokenMinter
+	// Workstation indicates non-production, single-user mode (e.g. local laptop).
+	// When true, /api/v1/system/* and other workstation-only endpoints are enabled.
+	Workstation bool
+	// DevUserConfig holds optional identity overrides for the development user.
+	DevUserConfig DevUserConfig
 }
 
 // MaintenanceConfig holds configuration for routine maintenance operation executors.
@@ -572,12 +578,15 @@ type Server struct {
 	// Phase 3/4 supply the real local-tunnel ops; tests override for exactly-once.
 	execDispatch     func(ctx context.Context, d store.BrokerDispatch) (string, error)
 	deliverMsg       func(ctx context.Context, m *store.Message) error
-	maintenance      *MaintenanceState // Runtime maintenance mode state
-	hubID            string            // Unique hub instance ID for secret namespacing
-	instanceID       string            // Unique per-process ID (uuid); affinity key for broker dispatch
-	embeddedBrokerID string            // Broker ID when running in hub+broker combo mode
-	scheduler        *Scheduler        // Unified scheduler for recurring tasks
-	cleanupOnce      sync.Once         // Ensures CleanupResources runs only once
+	maintenance      *MaintenanceState  // Runtime maintenance mode state
+	hubID            string             // Unique hub instance ID for secret namespacing
+	instanceID       string             // Unique per-process ID (uuid); affinity key for broker dispatch
+	embeddedBrokerID string             // Broker ID when running in hub+broker combo mode
+	workstation      bool               // True when running in workstation (non-production) mode
+	scheduler        *Scheduler         // Unified scheduler for recurring tasks
+	cleanupOnce      sync.Once          // Ensures CleanupResources runs only once
+	ctx              context.Context    // Server-lifetime context; cancelled on Shutdown
+	ctxCancel        context.CancelFunc // Cancels ctx
 
 	logQueryService *LogQueryService // Cloud Logging query service (nil = disabled)
 
@@ -644,6 +653,9 @@ type Server struct {
 
 	// Shared HTTP client for federation proxy calls (no redirect following).
 	federationClient *http.Client
+
+	imageBuildActive atomic.Bool
+	imagePullActive  atomic.Bool
 }
 
 func newInstanceID() string {
@@ -664,6 +676,8 @@ func New(cfg ServerConfig, s store.Store) (*Server, error) {
 		cfg.StalledThreshold = defaults.StalledThreshold
 	}
 
+	srvCtx, srvCancel := context.WithCancel(context.Background())
+
 	srv := &Server{
 		config:      cfg,
 		store:       s,
@@ -673,6 +687,9 @@ func New(cfg ServerConfig, s store.Store) (*Server, error) {
 		maintenance: NewMaintenanceState(cfg.AdminMode, cfg.MaintenanceMessage),
 		hubID:       cfg.HubID,
 		instanceID:  newInstanceID(),
+		workstation: cfg.Workstation,
+		ctx:         srvCtx,
+		ctxCancel:   srvCancel,
 
 		// Subsystem loggers
 		agentLifecycleLog: logging.Subsystem("hub.agent-lifecycle"),
@@ -876,7 +893,7 @@ func New(cfg ServerConfig, s store.Store) (*Server, error) {
 	// Seed the dev user when dev-auth is enabled so that Ent FK constraints
 	// on owner_id are satisfied when the dev user creates projects/groups.
 	if cfg.DevAuthToken != "" {
-		seedDevUser(ctx, s)
+		seedDevUser(ctx, s, cfg.DevUserConfig)
 	}
 
 	// Abort any maintenance operations/migrations left in "running" state from
@@ -893,6 +910,7 @@ func New(cfg ServerConfig, s store.Store) (*Server, error) {
 		Mode:               "production",
 		DevAuthEnabled:     cfg.DevAuthToken != "",
 		DevAuthToken:       cfg.DevAuthToken,
+		DevUserCfg:         cfg.DevUserConfig,
 		AgentTokenSvc:      srv.agentTokenService,
 		UserTokenSvc:       srv.userTokenService,
 		UATSvc:             srv.uatService,
@@ -1296,6 +1314,13 @@ func (s *Server) SetEmbeddedBrokerID(id string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.embeddedBrokerID = id
+}
+
+// GetEmbeddedBrokerID returns the co-located broker ID, if any.
+func (s *Server) GetEmbeddedBrokerID() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.embeddedBrokerID
 }
 
 // isEmbeddedBroker returns true if brokerID matches the co-located broker
@@ -2331,6 +2356,11 @@ func (s *Server) Shutdown(ctx context.Context) error {
 
 	slog.Info("Hub API server shutting down...")
 
+	// Cancel server-lifetime context to stop background goroutines
+	if s.ctxCancel != nil {
+		s.ctxCancel()
+	}
+
 	// Shutdown control channel first
 	if cc != nil {
 		cc.Shutdown()
@@ -2385,6 +2415,11 @@ func (s *Server) CleanupResources(ctx context.Context) error {
 		s.mu.RUnlock()
 
 		slog.Info("Cleaning up Hub resources...")
+
+		// Cancel server-lifetime context to stop background goroutines
+		if s.ctxCancel != nil {
+			s.ctxCancel()
+		}
 
 		if cc != nil {
 			cc.Shutdown()
@@ -2573,6 +2608,20 @@ func (s *Server) registerRoutes() {
 	// GitHub App webhook and setup callback (unauthenticated — uses webhook signature)
 	s.mux.HandleFunc("/api/v1/webhooks/github", s.handleGitHubWebhook)
 	s.mux.HandleFunc("/github-app/setup", s.handleGitHubAppSetup)
+
+	// Workstation-only system endpoints
+	s.mux.Handle("/api/v1/system/identity", s.requireWorkstation(http.HandlerFunc(s.handleSystemIdentity)))
+	s.mux.Handle("/api/v1/system/status", s.requireWorkstation(http.HandlerFunc(s.handleSystemStatus)))
+	s.mux.Handle("/api/v1/system/check", s.requireWorkstation(http.HandlerFunc(s.handleSystemCheck)))
+	s.mux.Handle("/api/v1/system/runtime", s.requireWorkstation(http.HandlerFunc(s.handleSystemRuntime)))
+	s.mux.Handle("/api/v1/system/init", s.requireWorkstation(http.HandlerFunc(s.handleSystemInit)))
+	s.mux.Handle("/api/v1/system/images/pull", s.requireWorkstation(http.HandlerFunc(s.handleSystemImagesPull)))
+	s.mux.Handle("/api/v1/system/images/build", s.requireWorkstation(http.HandlerFunc(s.handleSystemImagesBuild)))
+
+	// Workstation-only filesystem endpoints
+	s.mux.Handle("/api/v1/system/fs/list", s.requireWorkstation(http.HandlerFunc(s.handleFSList)))
+	s.mux.Handle("/api/v1/system/fs/mkdir", s.requireWorkstation(http.HandlerFunc(s.handleFSMkdir)))
+	s.mux.Handle("/api/v1/system/fs/validate-path", s.requireWorkstation(http.HandlerFunc(s.handleFSValidatePath)))
 }
 
 // applyMiddleware wraps the handler with middleware.
@@ -2647,6 +2696,31 @@ func (s *Server) corsMiddleware(next http.Handler) http.Handler {
 
 		next.ServeHTTP(w, r)
 	})
+}
+
+// requireWorkstation returns middleware that gates endpoints behind workstation mode.
+// Returns 404 when the server is not running in workstation mode.
+func (s *Server) requireWorkstation(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !s.workstation {
+			http.NotFound(w, r)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// assertLoopback checks that the request originates from a loopback address.
+func assertLoopback(r *http.Request) error {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	ip := net.ParseIP(host)
+	if ip == nil || !ip.IsLoopback() {
+		return fmt.Errorf("non-loopback request from %s", r.RemoteAddr)
+	}
+	return nil
 }
 
 // loggingMiddleware logs requests.

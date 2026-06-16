@@ -404,6 +404,9 @@ type V1AuthConfig struct {
 	UserAccessMode    string             `json:"user_access_mode,omitempty" yaml:"user_access_mode,omitempty" koanf:"user_access_mode"`
 	Proxy             *V1ProxyConfig     `json:"proxy,omitempty" yaml:"proxy,omitempty" koanf:"proxy"`
 	Transport         *V1TransportConfig `json:"transport,omitempty" yaml:"transport,omitempty" koanf:"transport"`
+	Username          string             `json:"username,omitempty" yaml:"username,omitempty" koanf:"username"`
+	DisplayName       string             `json:"display_name,omitempty" yaml:"display_name,omitempty" koanf:"display_name"`
+	Email             string             `json:"email,omitempty" yaml:"email,omitempty" koanf:"email"`
 }
 
 // V1TransportConfig holds transport-layer auth settings for agent outbound requests.
@@ -1375,6 +1378,15 @@ func ConvertV1ServerToGlobalConfig(v1 *V1ServerConfig) *GlobalConfig {
 				PlatformAuthSA: v1.Auth.Transport.PlatformAuthSA,
 			}
 		}
+		if v1.Auth.Username != "" {
+			gc.Auth.Username = v1.Auth.Username
+		}
+		if v1.Auth.DisplayName != "" {
+			gc.Auth.DisplayName = v1.Auth.DisplayName
+		}
+		if v1.Auth.Email != "" {
+			gc.Auth.Email = v1.Auth.Email
+		}
 	}
 
 	// OAuth config
@@ -1534,6 +1546,9 @@ func ConvertGlobalToV1ServerConfig(gc *GlobalConfig) *V1ServerConfig {
 		DevTokenFile:      gc.Auth.TokenFile,
 		AuthorizedDomains: gc.Auth.AuthorizedDomains,
 		UserAccessMode:    gc.Auth.UserAccessMode,
+		Username:          gc.Auth.Username,
+		DisplayName:       gc.Auth.DisplayName,
+		Email:             gc.Auth.Email,
 	}
 	if gc.Auth.Proxy != nil {
 		v1.Auth.Proxy = &V1ProxyConfig{
@@ -2015,6 +2030,32 @@ func UpdateVersionedSetting(dir string, key string, value string) error {
 			vs.Server.Broker = &V1BrokerConfig{}
 		}
 		vs.Server.Broker.BrokerNickname = value
+
+	// --- Server auth identity ---
+	case "server.auth.display_name":
+		if vs.Server == nil {
+			vs.Server = &V1ServerConfig{}
+		}
+		if vs.Server.Auth == nil {
+			vs.Server.Auth = &V1AuthConfig{}
+		}
+		vs.Server.Auth.DisplayName = value
+	case "server.auth.email":
+		if vs.Server == nil {
+			vs.Server = &V1ServerConfig{}
+		}
+		if vs.Server.Auth == nil {
+			vs.Server.Auth = &V1AuthConfig{}
+		}
+		vs.Server.Auth.Email = value
+	case "server.auth.username":
+		if vs.Server == nil {
+			vs.Server = &V1ServerConfig{}
+		}
+		if vs.Server.Auth == nil {
+			vs.Server.Auth = &V1AuthConfig{}
+		}
+		vs.Server.Auth.Username = value
 
 	// --- Deprecated keys: skip silently in v1 ---
 	case "hub.token", "hub.apiKey", "hub.lastSyncedAt":
