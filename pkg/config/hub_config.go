@@ -254,12 +254,51 @@ type IAPAuthConfig struct {
 	JWKSURL string `json:"jwksURL,omitempty" yaml:"jwksURL,omitempty" koanf:"jwksURL"`
 }
 
-// OAuthProviderConfig holds OAuth credentials for a single provider.
+// OAuthProviderConfig holds OAuth credentials for a single provider (Google/GitHub).
 type OAuthProviderConfig struct {
 	// ClientID is the OAuth application client ID.
 	ClientID string `json:"clientId" yaml:"clientId" koanf:"clientId"`
 	// ClientSecret is the OAuth application client secret.
 	ClientSecret string `json:"clientSecret" yaml:"clientSecret" koanf:"clientSecret"`
+}
+
+// GenericOAuthProviderConfig is a fully-configurable OAuth2/OIDC provider config
+// modeled on Better Auth's genericOAuth plugin. Field names mirror Better Auth's
+// genericOAuth config for consistency.
+//
+// Configure via SCION_SERVER_OAUTH_WEB_GENERIC_{CLIENTID,CLIENTSECRET,ISSUER}
+// or explicit GENERIC_{AUTHURL,TOKENURL,USERINFOURL}.
+type GenericOAuthProviderConfig struct {
+	ClientID     string `json:"clientId" yaml:"clientId" koanf:"clientId"`
+	ClientSecret string `json:"clientSecret" yaml:"clientSecret" koanf:"clientSecret"`
+
+	// Discovery — one of these is sufficient; explicit endpoints override.
+	DiscoveryURL     string   `json:"discoveryUrl" yaml:"discoveryUrl" koanf:"discoveryUrl"`
+	Issuer           string   `json:"issuer" yaml:"issuer" koanf:"issuer"`
+	DiscoveryHeaders []string `json:"discoveryHeaders" yaml:"discoveryHeaders" koanf:"discoveryHeaders"`
+
+	// Explicit endpoints — override anything from discovery.
+	AuthorizationURL string `json:"authorizationUrl" yaml:"authorizationUrl" koanf:"authorizationUrl"`
+	TokenURL         string `json:"tokenUrl" yaml:"tokenUrl" koanf:"tokenUrl"`
+	UserInfoURL      string `json:"userInfoUrl" yaml:"userInfoUrl" koanf:"userInfoUrl"`
+
+	// Authorization request parameters.
+	Scopes       []string `json:"scopes" yaml:"scopes" koanf:"scopes"`
+	ResponseType string   `json:"responseType" yaml:"responseType" koanf:"responseType"`
+	Prompt       string   `json:"prompt" yaml:"prompt" koanf:"prompt"`
+	AccessType   string   `json:"accessType" yaml:"accessType" koanf:"accessType"`
+
+	// PKCE (RFC 7636). Required by some providers.
+	PKCE bool `json:"pkce" yaml:"pkce" koanf:"pkce"`
+
+	// Authentication method for the token endpoint: "post" (default) or "basic".
+	Authentication string `json:"authentication" yaml:"authentication" koanf:"authentication"`
+
+	// RequireIssuerValidation enforces the `iss` callback parameter (RFC 9207).
+	RequireIssuerValidation bool `json:"requireIssuerValidation" yaml:"requireIssuerValidation" koanf:"requireIssuerValidation"`
+
+	// RedirectURI overrides the default callback URL.
+	RedirectURI string `json:"redirectUri" yaml:"redirectUri" koanf:"redirectUri"`
 }
 
 // OAuthClientConfig holds OAuth provider configurations for a specific client type.
@@ -268,6 +307,9 @@ type OAuthClientConfig struct {
 	Google OAuthProviderConfig `json:"google" yaml:"google" koanf:"google"`
 	// GitHub OAuth settings for this client type.
 	GitHub OAuthProviderConfig `json:"github" yaml:"github" koanf:"github"`
+	// Generic is a fully-configurable OAuth2/OIDC provider (e.g. Dex).
+	// Only supported for Web client flows; CLI and Device use Google/GitHub only.
+	Generic GenericOAuthProviderConfig `json:"generic" yaml:"generic" koanf:"generic"`
 }
 
 // OAuthConfig holds OAuth provider configurations.
