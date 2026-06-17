@@ -363,7 +363,7 @@ func (s *Server) handleAuthToken(w http.ResponseWriter, r *http.Request) {
 
 	// Exchange code for user info
 	ctx := r.Context()
-	userInfo, err := s.oauthService.ExchangeCodeForClient(ctx, oauthClientType, provider, req.Code, req.RedirectURI)
+	userInfo, err := s.oauthService.ExchangeCodeForClient(ctx, oauthClientType, provider, req.Code, req.RedirectURI, "", "")
 	if err != nil {
 		slog.Error("OAuth code exchange failed", "provider", provider, "error", err)
 		writeError(w, http.StatusBadRequest, "oauth_error",
@@ -778,7 +778,7 @@ func (s *Server) handleCLIAuthAuthorize(w http.ResponseWriter, r *http.Request) 
 	}
 
 	// Generate authorization URL using CLI OAuth client
-	authURL, err := s.oauthService.GetAuthorizationURLForClient(OAuthClientTypeCLI, provider, req.CallbackURL, req.State)
+	authURL, err := s.oauthService.GetAuthorizationURLForClient(r.Context(), OAuthClientTypeCLI, provider, req.CallbackURL, req.State)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "oauth_error",
 			"failed to generate authorization URL: "+err.Error(), nil)
@@ -877,7 +877,7 @@ func (s *Server) handleCLIAuthToken(w http.ResponseWriter, r *http.Request) {
 
 	// Exchange code for user info using CLI OAuth client
 	ctx := r.Context()
-	userInfo, err := s.oauthService.ExchangeCodeForClient(ctx, OAuthClientTypeCLI, provider, req.Code, req.CallbackURL)
+	userInfo, err := s.oauthService.ExchangeCodeForClient(ctx, OAuthClientTypeCLI, provider, req.Code, req.CallbackURL, "", "")
 	if err != nil {
 		slog.Error("CLI OAuth code exchange failed", "provider", provider, "error", err)
 		writeError(w, http.StatusBadRequest, "oauth_error",
