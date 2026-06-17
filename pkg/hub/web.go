@@ -1311,7 +1311,7 @@ func (ws *WebServer) handleOAuthLogin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Validate provider
-	if provider != "google" && provider != "github" {
+	if provider != "google" && provider != "github" && provider != "generic" {
 		http.Error(w, "unsupported OAuth provider", http.StatusBadRequest)
 		return
 	}
@@ -1351,7 +1351,7 @@ func (ws *WebServer) handleOAuthLogin(w http.ResponseWriter, r *http.Request) {
 	redirectURI := ws.config.BaseURL + "/auth/callback/" + provider
 
 	// Get authorization URL
-	authURL, err := ws.oauthService.GetAuthorizationURLForClient(OAuthClientTypeWeb, provider, redirectURI, state)
+	authURL, err := ws.oauthService.GetAuthorizationURLForClient(r.Context(), OAuthClientTypeWeb, provider, redirectURI, state)
 	if err != nil {
 		slog.Error("Failed to generate OAuth URL", "provider", provider, "error", err)
 		http.Error(w, "failed to generate auth URL", http.StatusInternalServerError)
@@ -1368,7 +1368,7 @@ func (ws *WebServer) handleOAuthCallback(w http.ResponseWriter, r *http.Request)
 	provider := strings.TrimPrefix(r.URL.Path, "/auth/callback/")
 	provider = strings.TrimSuffix(provider, "/")
 
-	if provider != "google" && provider != "github" {
+	if provider != "google" && provider != "github" && provider != "generic" {
 		http.Error(w, "unsupported OAuth provider", http.StatusBadRequest)
 		return
 	}
@@ -1416,7 +1416,8 @@ func (ws *WebServer) handleOAuthCallback(w http.ResponseWriter, r *http.Request)
 
 	// Exchange code for user info (direct function call, no HTTP)
 	ctx := r.Context()
-	userInfo, err := ws.oauthService.ExchangeCodeForClient(ctx, OAuthClientTypeWeb, provider, code, redirectURI)
+	iss := r.URL.Query().Get("iss")
+	userInfo, err := ws.oauthService.ExchangeCodeForClient(ctx, OAuthClientTypeWeb, provider, code, redirectURI, "", iss)
 	if err != nil {
 		slog.Error("OAuth code exchange failed", "provider", provider, "error", err)
 		http.Redirect(w, r, "/login?error=exchange_failed", http.StatusFound)
