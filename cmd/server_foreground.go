@@ -993,6 +993,16 @@ func initHubServer(ctx context.Context, cfg *config.GlobalConfig, s store.Store,
 					ClientID:     cfg.OAuth.Web.GitHub.ClientID,
 					ClientSecret: cfg.OAuth.Web.GitHub.ClientSecret,
 				},
+				Generic: hub.OAuthProviderConfig{
+					ClientID:         cfg.OAuth.Web.Generic.ClientID,
+					ClientSecret:     cfg.OAuth.Web.Generic.ClientSecret,
+					DiscoveryURL:     cfg.OAuth.Web.Generic.DiscoveryURL,
+					Issuer:           cfg.OAuth.Web.Generic.Issuer,
+					AuthorizationURL: cfg.OAuth.Web.Generic.AuthorizationURL,
+					TokenURL:         cfg.OAuth.Web.Generic.TokenURL,
+					UserInfoURL:      cfg.OAuth.Web.Generic.UserInfoURL,
+					Scopes:           cfg.OAuth.Web.Generic.Scopes,
+				},
 			},
 			CLI: hub.OAuthClientConfig{
 				Google: hub.OAuthProviderConfig{
