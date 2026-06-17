@@ -28,6 +28,10 @@ type OAuthClientType string
 const (
 	OAuthProviderGoogle = "google"
 	OAuthProviderGitHub = "github"
+	// OAuthProviderGeneric is a generic, configurable OAuth2/OIDC provider
+	// (e.g. the in-cluster Dex). Unlike Google/GitHub, its endpoints are
+	// resolved from the issuer's OIDC discovery document, or set explicitly.
+	OAuthProviderGeneric = "generic"
 
 	OAuthClientTypeWeb    OAuthClientType = "web"
 	OAuthClientTypeCLI    OAuthClientType = "cli"
@@ -38,6 +42,7 @@ func OAuthProviderOrder() []string {
 	return []string{
 		OAuthProviderGoogle,
 		OAuthProviderGitHub,
+		OAuthProviderGeneric,
 	}
 }
 

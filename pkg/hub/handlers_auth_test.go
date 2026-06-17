@@ -27,6 +27,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/GoogleCloudPlatform/scion/pkg/hubclient"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 )
 
@@ -384,6 +385,37 @@ func TestAuthTokenProviderInference(t *testing.T) {
 	}
 }
 
+// TestAuthToken_GenericProviderAccepted guards against handleAuthToken's
+// provider allowlist rejecting "generic" before it reaches the OAuth
+// service — web.go's redirect-flow handlers already accept "generic", and
+// this endpoint must not be a dead end for it.
+func TestAuthToken_GenericProviderAccepted(t *testing.T) {
+	srv, _ := testServer(t)
+
+	body := AuthTokenRequest{
+		Code:        "test-code",
+		RedirectURI: "http://localhost:8080/callback",
+		GrantType:   "authorization_code",
+		Provider:    "generic",
+	}
+	rec := doRequestNoAuth(t, srv, http.MethodPost, "/api/v1/auth/token", body)
+
+	// testServer(t) has no OAuth configured, so this must fail with
+	// "not_implemented" (501) — NOT "invalid_provider" (400). A 400 here
+	// would mean "generic" is still being rejected by a hardcoded allowlist.
+	if rec.Code != http.StatusNotImplemented {
+		t.Errorf("expected status 501 (OAuth not configured), got %d: %s", rec.Code, rec.Body.String())
+	}
+	var errResp struct {
+		Error string `json:"error"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&errResp); err == nil {
+		if errResp.Error == "invalid_provider" {
+			t.Error("\"generic\" was rejected as invalid_provider — provider allowlist regression")
+		}
+	}
+}
+
 func TestCLIDeviceAuthorize_OAuthNotConfigured(t *testing.T) {
 	srv, _ := testServer(t)
 
@@ -442,6 +474,136 @@ func TestCLIAuthProviders_ReturnsConfiguredProviders(t *testing.T) {
 	}
 	if len(resp.Providers) != 1 || resp.Providers[0] != "github" {
 		t.Fatalf("expected providers [github], got %v", resp.Providers)
+	}
+}
+
+// TestCLIAuthAuthorize_GenericProvider confirms the generic OAuth provider
+// is reachable from the CLI's authorization-code + loopback-redirect flow,
+// not just the Web flow — CLI's caller-supplied CallbackURL requires the
+// issuer to accept a flexible/localhost redirect, so this only exercises
+// scion's own dispatch, not third-party issuer behavior.
+func TestCLIAuthAuthorize_GenericProvider(t *testing.T) {
+	srv, _ := testServer(t)
+	srv.oauthService = NewOAuthService(OAuthConfig{
+		CLI: OAuthClientConfig{
+			Generic: GenericOAuthProviderConfig{
+				ClientID:         "cli-generic-id",
+				ClientSecret:     "cli-generic-secret",
+				AuthorizationURL: "https://idp.example.com/auth",
+				TokenURL:         "https://idp.example.com/token",
+			},
+		},
+	})
+
+	body := CLIAuthAuthorizeRequest{
+		CallbackURL: "http://localhost:54321/callback",
+		State:       "state-abc",
+		Provider:    hubclient.OAuthProviderGeneric,
+	}
+	rec := doRequestNoAuth(t, srv, http.MethodPost, "/api/v1/auth/cli/authorize", body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var resp CLIAuthAuthorizeResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if !strings.HasPrefix(resp.URL, "https://idp.example.com/auth?") {
+		t.Errorf("authorize URL = %q, want prefix https://idp.example.com/auth?", resp.URL)
+	}
+}
+
+// TestCLIAuthProviders_GenericConfigIsolatedPerClientType confirms each
+// client type's Generic config is independent: a CLI-scoped Generic config
+// does not leak into Device's provider list (Generic itself is supported by
+// Device too — see TestCLIDeviceAuthorize_GenericProvider — but only when
+// Device.Generic is configured, same as Google/GitHub's per-client-type
+// scoping).
+func TestCLIAuthProviders_GenericConfigIsolatedPerClientType(t *testing.T) {
+	srv, _ := testServer(t)
+	srv.oauthService = NewOAuthService(OAuthConfig{
+		CLI: OAuthClientConfig{
+			Generic: GenericOAuthProviderConfig{
+				ClientID:         "cli-generic-id",
+				ClientSecret:     "cli-generic-secret",
+				AuthorizationURL: "https://idp.example.com/auth",
+				TokenURL:         "https://idp.example.com/token",
+			},
+		},
+	})
+
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/api/v1/auth/providers?clientType=device", nil)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	var resp CLIAuthProvidersResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	for _, p := range resp.Providers {
+		if p == hubclient.OAuthProviderGeneric {
+			t.Errorf("device provider list unexpectedly includes generic from a CLI-only config: %v", resp.Providers)
+		}
+	}
+}
+
+// TestCLIDeviceAuthorize_GenericProvider confirms the device authorization
+// grant (RFC 8628) works end-to-end for the generic provider when the issuer
+// advertises device_authorization_endpoint via OIDC discovery (as Dex and Ory
+// Hydra both do).
+func TestCLIDeviceAuthorize_GenericProvider(t *testing.T) {
+	mux := http.NewServeMux()
+	idp := httptest.NewServer(mux)
+	defer idp.Close()
+
+	mux.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"issuer":                        idp.URL,
+			"authorization_endpoint":        idp.URL + "/auth",
+			"token_endpoint":                idp.URL + "/token",
+			"device_authorization_endpoint": idp.URL + "/device/code",
+		})
+	})
+	mux.HandleFunc("/device/code", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"device_code":               "dc-1",
+			"user_code":                 "ABCD-EFGH",
+			"verification_uri":          idp.URL + "/device",
+			"verification_uri_complete": idp.URL + "/device?user_code=ABCD-EFGH",
+			"expires_in":                600,
+			"interval":                  5,
+		})
+	})
+
+	srv, _ := testServer(t)
+	srv.oauthService = NewOAuthService(OAuthConfig{
+		Device: OAuthClientConfig{
+			Generic: GenericOAuthProviderConfig{
+				ClientID:     "device-generic-id",
+				ClientSecret: "device-generic-secret",
+				DiscoveryURL: idp.URL + "/.well-known/openid-configuration",
+			},
+		},
+	})
+
+	body := CLIDeviceAuthorizeRequest{Provider: hubclient.OAuthProviderGeneric}
+	rec := doRequestNoAuth(t, srv, http.MethodPost, "/api/v1/auth/cli/device", body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var resp CLIDeviceAuthorizeResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if resp.DeviceCode != "dc-1" {
+		t.Errorf("DeviceCode = %q, want dc-1", resp.DeviceCode)
+	}
+	if resp.UserCode != "ABCD-EFGH" {
+		t.Errorf("UserCode = %q, want ABCD-EFGH", resp.UserCode)
 	}
 }
 
@@ -574,6 +736,42 @@ func TestProvisionUser(t *testing.T) {
 		// AvatarURL should NOT be updated (original was non-empty)
 		if user.AvatarURL != "https://example.com/original.png" {
 			t.Errorf("expected original avatar URL, got %q", user.AvatarURL)
+		}
+	})
+
+	t.Run("OverrideUserInfo refreshes non-empty display name and avatar", func(t *testing.T) {
+		srv, s := testServer(t)
+
+		original := &store.User{
+			ID:          generateID(),
+			Email:       "override@example.com",
+			DisplayName: "Stale Name",
+			AvatarURL:   "https://example.com/stale.png",
+			Role:        "member",
+			Status:      "active",
+			Created:     time.Now().Add(-24 * time.Hour),
+			LastLogin:   time.Now().Add(-24 * time.Hour),
+		}
+		if err := s.CreateUser(ctx, original); err != nil {
+			t.Fatalf("failed to create user: %v", err)
+		}
+
+		info := &ExternalUserInfo{
+			Email:            "override@example.com",
+			DisplayName:      "Fresh Name",
+			AvatarURL:        "https://example.com/fresh.png",
+			OverrideUserInfo: true,
+		}
+
+		user, err := srv.provisionUser(ctx, info)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if user.DisplayName != "Fresh Name" {
+			t.Errorf("expected OverrideUserInfo to refresh display name, got %q", user.DisplayName)
+		}
+		if user.AvatarURL != "https://example.com/fresh.png" {
+			t.Errorf("expected OverrideUserInfo to refresh avatar URL, got %q", user.AvatarURL)
 		}
 	})
 

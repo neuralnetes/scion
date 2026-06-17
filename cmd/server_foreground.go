@@ -1186,6 +1186,37 @@ func resolveSessionSecret() string {
 	return secret
 }
 
+// genericOAuthConfigFromSettings converts the config-loading representation
+// of the generic OAuth2/OIDC provider into the hub package's runtime type.
+func genericOAuthConfigFromSettings(g config.GenericOAuthProviderConfig) hub.GenericOAuthProviderConfig {
+	return hub.GenericOAuthProviderConfig{
+		ClientID:                g.ClientID,
+		ClientSecret:            g.ClientSecret,
+		DiscoveryURL:            g.DiscoveryURL,
+		Issuer:                  g.Issuer,
+		DiscoveryHeaders:        g.DiscoveryHeaders,
+		AuthorizationURL:        g.AuthorizationURL,
+		TokenURL:                g.TokenURL,
+		UserInfoURL:             g.UserInfoURL,
+		DeviceAuthorizationURL:  g.DeviceAuthorizationURL,
+		Scopes:                  g.Scopes,
+		ResponseType:            g.ResponseType,
+		Prompt:                  g.Prompt,
+		AccessType:              g.AccessType,
+		PKCE:                    g.PKCE,
+		Authentication:          g.Authentication,
+		RequireIssuerValidation: g.RequireIssuerValidation,
+		RedirectURI:             g.RedirectURI,
+		OverrideUserInfo:        g.OverrideUserInfo,
+		ClaimMapping: hub.ClaimMapping{
+			ID:      g.ClaimMapping.ID,
+			Email:   g.ClaimMapping.Email,
+			Name:    g.ClaimMapping.Name,
+			Picture: g.ClaimMapping.Picture,
+		},
+	}
+}
+
 // initHubServer creates and configures the Hub server.
 func initHubServer(ctx context.Context, cfg *config.GlobalConfig, s store.Store, entClient *ent.Client, hubEndpoint, devAuthToken string, adminEmailList []string, adminMode bool, maintenanceMessage string, requestLogger, messageLogger *slog.Logger, globalDir string, pluginMgr *scionplugin.Manager, secretBackend secret.SecretBackend) (*hub.Server, error) {
 	hubCfg := hub.ServerConfig{
@@ -1240,7 +1271,12 @@ func initHubServer(ctx context.Context, cfg *config.GlobalConfig, s store.Store,
 					ClientID:     cfg.OAuth.Web.GitHub.ClientID,
 					ClientSecret: cfg.OAuth.Web.GitHub.ClientSecret,
 				},
+				Generic: genericOAuthConfigFromSettings(cfg.OAuth.Web.Generic),
 			},
+			// CLI uses the authorization-code + loopback-redirect flow with a
+			// caller-supplied CallbackURL (e.g. http://localhost:<port>/callback)
+			// — any standards-compliant issuer that accepts a flexible/localhost
+			// redirect URI for this client works here.
 			CLI: hub.OAuthClientConfig{
 				Google: hub.OAuthProviderConfig{
 					ClientID:     cfg.OAuth.CLI.Google.ClientID,
@@ -1250,7 +1286,13 @@ func initHubServer(ctx context.Context, cfg *config.GlobalConfig, s store.Store,
 					ClientID:     cfg.OAuth.CLI.GitHub.ClientID,
 					ClientSecret: cfg.OAuth.CLI.GitHub.ClientSecret,
 				},
+				Generic: genericOAuthConfigFromSettings(cfg.OAuth.CLI.Generic),
 			},
+			// Device uses the RFC 8628 device authorization grant (headless/SSH
+			// CLI login, no local browser or loopback listener). Generic works
+			// only when the issuer advertises device_authorization_endpoint (Dex,
+			// Ory Hydra both do) or DeviceAuthorizationURL is set explicitly —
+			// see GenericOAuthProviderConfig.DeviceAuthorizationURL.
 			Device: hub.OAuthClientConfig{
 				Google: hub.OAuthProviderConfig{
 					ClientID:     cfg.OAuth.Device.Google.ClientID,
@@ -1260,6 +1302,7 @@ func initHubServer(ctx context.Context, cfg *config.GlobalConfig, s store.Store,
 					ClientID:     cfg.OAuth.Device.GitHub.ClientID,
 					ClientSecret: cfg.OAuth.Device.GitHub.ClientSecret,
 				},
+				Generic: genericOAuthConfigFromSettings(cfg.OAuth.Device.Generic),
 			},
 		},
 		MaintenanceConfig: resolveMaintenanceConfig(cfg),

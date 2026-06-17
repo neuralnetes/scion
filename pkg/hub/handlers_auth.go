@@ -24,6 +24,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/GoogleCloudPlatform/scion/pkg/hubclient"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 	"github.com/google/uuid"
 )
@@ -188,6 +189,11 @@ type ExternalUserInfo struct {
 	Email       string
 	DisplayName string
 	AvatarURL   string
+
+	// OverrideUserInfo, when true, refreshes DisplayName/AvatarURL from this
+	// login even for an existing user. Default (false) only backfills empty
+	// fields. Currently only set by the generic OAuth provider.
+	OverrideUserInfo bool
 }
 
 // ErrAccessDenied is returned by provisionUser when the user's email is not
@@ -259,9 +265,10 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 	// Provision user (authorize + find-or-create + hub membership)
 	ctx := r.Context()
 	user, err := s.provisionUser(ctx, &ExternalUserInfo{
-		Email:       userInfo.Email,
-		DisplayName: userInfo.DisplayName,
-		AvatarURL:   userInfo.AvatarURL,
+		Email:            userInfo.Email,
+		DisplayName:      userInfo.DisplayName,
+		AvatarURL:        userInfo.AvatarURL,
+		OverrideUserInfo: userInfo.OverrideUserInfo,
 	})
 	if err != nil {
 		if errors.Is(err, ErrAccessDenied) {
@@ -341,8 +348,11 @@ func (s *Server) handleAuthToken(w http.ResponseWriter, r *http.Request) {
 		slog.Debug("OAuth provider inferred", "provider", provider)
 	}
 
-	// Validate provider is a known value
-	if provider != "google" && provider != "github" {
+	// Validate provider is a known value. web.go's redirect-flow handlers
+	// (handleOAuthLogin/handleOAuthCallback) already accept "generic"; this
+	// endpoint (the Web SPA / API code-exchange path) must match, or the
+	// generic provider is unreachable here even when fully configured.
+	if provider != "google" && provider != "github" && provider != hubclient.OAuthProviderGeneric {
 		writeError(w, http.StatusBadRequest, "invalid_provider",
 			"unsupported OAuth provider", nil)
 		return
@@ -365,7 +375,7 @@ func (s *Server) handleAuthToken(w http.ResponseWriter, r *http.Request) {
 
 	// Exchange code for user info
 	ctx := r.Context()
-	userInfo, err := s.oauthService.ExchangeCodeForClient(ctx, oauthClientType, provider, req.Code, req.RedirectURI)
+	userInfo, err := s.oauthService.ExchangeCodeForClient(ctx, oauthClientType, provider, req.Code, req.RedirectURI, "", "")
 	if err != nil {
 		slog.Error("OAuth code exchange failed", "provider", provider, "error", err)
 		writeError(w, http.StatusBadRequest, "oauth_error",
@@ -375,9 +385,10 @@ func (s *Server) handleAuthToken(w http.ResponseWriter, r *http.Request) {
 
 	// Provision user (authorize + find-or-create + hub membership)
 	user, err := s.provisionUser(ctx, &ExternalUserInfo{
-		Email:       userInfo.Email,
-		DisplayName: userInfo.DisplayName,
-		AvatarURL:   userInfo.AvatarURL,
+		Email:            userInfo.Email,
+		DisplayName:      userInfo.DisplayName,
+		AvatarURL:        userInfo.AvatarURL,
+		OverrideUserInfo: userInfo.OverrideUserInfo,
 	})
 	if err != nil {
 		if errors.Is(err, ErrAccessDenied) {
@@ -798,7 +809,7 @@ func (s *Server) handleCLIAuthAuthorize(w http.ResponseWriter, r *http.Request) 
 	}
 
 	// Generate authorization URL using CLI OAuth client
-	authURL, err := s.oauthService.GetAuthorizationURLForClient(OAuthClientTypeCLI, provider, req.CallbackURL, req.State)
+	authURL, err := s.oauthService.GetAuthorizationURLForClient(r.Context(), OAuthClientTypeCLI, provider, req.CallbackURL, req.State)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "oauth_error",
 			"failed to generate authorization URL: "+err.Error(), nil)
@@ -897,7 +908,7 @@ func (s *Server) handleCLIAuthToken(w http.ResponseWriter, r *http.Request) {
 
 	// Exchange code for user info using CLI OAuth client
 	ctx := r.Context()
-	userInfo, err := s.oauthService.ExchangeCodeForClient(ctx, OAuthClientTypeCLI, provider, req.Code, req.CallbackURL)
+	userInfo, err := s.oauthService.ExchangeCodeForClient(ctx, OAuthClientTypeCLI, provider, req.Code, req.CallbackURL, "", "")
 	if err != nil {
 		slog.Error("CLI OAuth code exchange failed", "provider", provider, "error", err)
 		writeError(w, http.StatusBadRequest, "oauth_error",
@@ -907,9 +918,10 @@ func (s *Server) handleCLIAuthToken(w http.ResponseWriter, r *http.Request) {
 
 	// Provision user (authorize + find-or-create + hub membership)
 	user, err := s.provisionUser(ctx, &ExternalUserInfo{
-		Email:       userInfo.Email,
-		DisplayName: userInfo.DisplayName,
-		AvatarURL:   userInfo.AvatarURL,
+		Email:            userInfo.Email,
+		DisplayName:      userInfo.DisplayName,
+		AvatarURL:        userInfo.AvatarURL,
+		OverrideUserInfo: userInfo.OverrideUserInfo,
 	})
 	if err != nil {
 		if errors.Is(err, ErrAccessDenied) {
@@ -1123,9 +1135,31 @@ func (s *Server) getDeviceFlowUserInfo(ctx context.Context, provider, accessToke
 		return s.oauthService.getGoogleUserInfo(ctx, accessToken)
 	case "github":
 		return s.oauthService.getGitHubUserInfo(ctx, accessToken)
+	case hubclient.OAuthProviderGeneric:
+		return s.getGenericDeviceFlowUserInfo(ctx, accessToken)
 	default:
 		return nil, fmt.Errorf("unsupported provider: %s", provider)
 	}
+}
+
+// getGenericDeviceFlowUserInfo resolves the Device-scoped generic provider
+// config and fetches user info via the userinfo endpoint. Unlike the
+// authorization-code flow, this does not attempt id_token decoding — the
+// device token poll response isn't threaded through to this call, matching
+// google/github's device flow, which likewise always uses the userinfo
+// endpoint rather than decoding an id_token.
+func (s *Server) getGenericDeviceFlowUserInfo(ctx context.Context, accessToken string) (*OAuthUserInfo, error) {
+	cfg := s.oauthService.getClientConfig(OAuthClientTypeDevice).Generic
+	ep, err := s.oauthService.resolveGenericEndpoints(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	info, err := s.oauthService.getGenericUserInfo(ctx, ep.UserInfoURL, accessToken, cfg.ClaimMapping)
+	if err != nil {
+		return nil, err
+	}
+	info.OverrideUserInfo = cfg.OverrideUserInfo
+	return info, nil
 }
 
 // completeOAuthLogin is the shared logic for completing an OAuth login
@@ -1135,9 +1169,10 @@ func (s *Server) completeOAuthLogin(w http.ResponseWriter, r *http.Request, user
 
 	// Provision user (authorize + find-or-create + hub membership)
 	user, err := s.provisionUser(ctx, &ExternalUserInfo{
-		Email:       userInfo.Email,
-		DisplayName: userInfo.DisplayName,
-		AvatarURL:   userInfo.AvatarURL,
+		Email:            userInfo.Email,
+		DisplayName:      userInfo.DisplayName,
+		AvatarURL:        userInfo.AvatarURL,
+		OverrideUserInfo: userInfo.OverrideUserInfo,
 	})
 	if err != nil {
 		if errors.Is(err, ErrAccessDenied) {
@@ -1224,12 +1259,13 @@ func (s *Server) provisionUser(ctx context.Context, info *ExternalUserInfo) (*st
 			return nil, ErrUserSuspended
 		}
 
-		// Update last login and backfill profile
+		// Update last login and refresh profile. Default: only backfill empty
+		// fields. OverrideUserInfo forces a refresh from this login instead.
 		user.LastLogin = time.Now()
-		if info.AvatarURL != "" && user.AvatarURL == "" {
+		if info.AvatarURL != "" && (info.OverrideUserInfo || user.AvatarURL == "") {
 			user.AvatarURL = info.AvatarURL
 		}
-		if info.DisplayName != "" && user.DisplayName == "" {
+		if info.DisplayName != "" && (info.OverrideUserInfo || user.DisplayName == "") {
 			user.DisplayName = info.DisplayName
 		}
 		// Re-evaluate admin status on every login
