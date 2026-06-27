@@ -436,7 +436,21 @@ func (c *ControlChannelClient) handleMessage(data []byte) error {
 
 	switch env.Type {
 	case wsprotocol.TypeRequest:
-		return c.handleRequest(data)
+		// Run tunneled requests off the read loop. Slow dispatches (e.g.
+		// POST /api/v1/agents waiting ~90s for an agent pod to start) would
+		// otherwise block ReadMessage, so the Hub's pings go unanswered, the
+		// Hub times out the session, and the eventual response is written to
+		// a dead connection (502 "control channel request failed").
+		// Connection writes are mutex-serialized, so concurrent responses
+		// are safe.
+		c.wg.Add(1)
+		go func() {
+			defer c.wg.Done()
+			if err := c.handleRequest(data); err != nil {
+				c.log.Error("Control channel request handling error", "error", err)
+			}
+		}()
+		return nil
 	case wsprotocol.TypeStreamOpen:
 		return c.handleStreamOpen(data)
 	case wsprotocol.TypeStream:

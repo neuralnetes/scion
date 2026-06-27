@@ -22,26 +22,79 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/hubclient"
 )
 
-// OAuthProviderConfig holds OAuth credentials for a single provider.
+// OAuthProviderConfig holds OAuth credentials for a single provider (Google/GitHub).
 type OAuthProviderConfig struct {
 	ClientID     string
 	ClientSecret string
 }
 
+// GenericOAuthProviderConfig is a fully-configurable OAuth2/OIDC provider config
+// modeled on Better Auth's genericOAuth plugin. Supports any standards-compliant
+// issuer (e.g. Dex) via OIDC discovery or explicit endpoint configuration.
+//
+// Endpoint resolution order (mirrors Better Auth):
+//  1. Explicit AuthorizationURL + TokenURL win unconditionally.
+//  2. DiscoveryURL fetches the OIDC discovery document.
+//  3. Issuer derives the discovery URL (Issuer + "/.well-known/openid-configuration").
+type GenericOAuthProviderConfig struct {
+	ClientID     string
+	ClientSecret string
+
+	// Discovery — one of these is sufficient; explicit endpoints below override.
+	DiscoveryURL     string   // full .well-known/openid-configuration URL
+	Issuer           string   // derives DiscoveryURL when DiscoveryURL is unset
+	DiscoveryHeaders []string // "Key: Value" headers for the discovery request
+
+	// Explicit endpoints — override anything discovered.
+	AuthorizationURL string
+	TokenURL         string
+	UserInfoURL      string
+
+	// Authorization request parameters.
+	Scopes       []string // defaults to ["openid", "email", "profile"]
+	ResponseType string   // defaults to "code"
+	Prompt       string   // none | login | consent | select_account
+	AccessType   string   // "offline" to request a refresh token
+
+	// PKCE (RFC 7636). Required by some providers (e.g. Dex with public clients).
+	PKCE bool
+
+	// Authentication method for the token endpoint: "post" (default) or "basic".
+	Authentication string
+
+	// RequireIssuerValidation validates the `iss` callback parameter (RFC 9207).
+	RequireIssuerValidation bool
+
+	// RedirectURI overrides the default callback URL constructed by the hub.
+	RedirectURI string
+}
+
+// IsConfigured returns true when the generic provider has credentials and a
+// way to resolve at least the authorization and token endpoints.
+func (c *GenericOAuthProviderConfig) IsConfigured() bool {
+	if c.ClientID == "" {
+		return false
+	}
+	return c.DiscoveryURL != "" || c.Issuer != "" ||
+		(c.AuthorizationURL != "" && c.TokenURL != "")
+}
+
 // OAuthClientConfig holds OAuth provider configurations for a specific client type.
 type OAuthClientConfig struct {
-	Google OAuthProviderConfig
-	GitHub OAuthProviderConfig
+	Google  OAuthProviderConfig
+	GitHub  OAuthProviderConfig
+	Generic GenericOAuthProviderConfig
 }
 
 // IsConfigured returns true if at least one OAuth provider is configured.
 func (c *OAuthClientConfig) IsConfigured() bool {
-	return c.Google.ClientID != "" || c.GitHub.ClientID != ""
+	return c.Google.ClientID != "" || c.GitHub.ClientID != "" || c.Generic.IsConfigured()
 }
 
 // IsProviderConfigured returns true if the specified provider is configured.
@@ -51,6 +104,8 @@ func (c *OAuthClientConfig) IsProviderConfigured(provider string) bool {
 		return c.Google.ClientID != "" && c.Google.ClientSecret != ""
 	case hubclient.OAuthProviderGitHub:
 		return c.GitHub.ClientID != "" && c.GitHub.ClientSecret != ""
+	case hubclient.OAuthProviderGeneric:
+		return c.Generic.IsConfigured()
 	default:
 		return false
 	}
@@ -110,6 +165,10 @@ func oauthProviderOrder() []string {
 type OAuthService struct {
 	config     OAuthConfig
 	httpClient *http.Client
+
+	// oidcCache memoizes OIDC discovery documents keyed by issuer URL.
+	oidcMu    sync.RWMutex
+	oidcCache map[string]*oidcDiscovery
 }
 
 // NewOAuthService creates a new OAuth service.
@@ -119,6 +178,7 @@ func NewOAuthService(config OAuthConfig) *OAuthService {
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
 		},
+		oidcCache: make(map[string]*oidcDiscovery),
 	}
 }
 
@@ -198,13 +258,13 @@ const (
 
 // GetAuthorizationURL generates an OAuth authorization URL for the specified provider.
 // Uses the default (CLI) client configuration for backward compatibility.
-func (s *OAuthService) GetAuthorizationURL(provider, callbackURL, state string) (string, error) {
-	return s.GetAuthorizationURLForClient(OAuthClientTypeCLI, provider, callbackURL, state)
+func (s *OAuthService) GetAuthorizationURL(ctx context.Context, provider, callbackURL, state string) (string, error) {
+	return s.GetAuthorizationURLForClient(ctx, OAuthClientTypeCLI, provider, callbackURL, state)
 }
 
 // GetAuthorizationURLForClient generates an OAuth authorization URL for the specified
 // provider and client type.
-func (s *OAuthService) GetAuthorizationURLForClient(clientType OAuthClientType, provider, callbackURL, state string) (string, error) {
+func (s *OAuthService) GetAuthorizationURLForClient(ctx context.Context, clientType OAuthClientType, provider, callbackURL, state string) (string, error) {
 	cfg := s.getClientConfig(clientType)
 
 	switch provider {
@@ -212,6 +272,8 @@ func (s *OAuthService) GetAuthorizationURLForClient(clientType OAuthClientType, 
 		return s.getGoogleAuthURLWithConfig(cfg.Google, callbackURL, state)
 	case hubclient.OAuthProviderGitHub:
 		return s.getGitHubAuthURLWithConfig(cfg.GitHub, callbackURL, state)
+	case hubclient.OAuthProviderGeneric:
+		return s.getGenericAuthURLWithConfig(ctx, cfg.Generic, callbackURL, state, "")
 	default:
 		return "", fmt.Errorf("unsupported OAuth provider: %s", provider)
 	}
@@ -269,12 +331,14 @@ func (s *OAuthService) getGitHubAuthURLWithConfig(cfg OAuthProviderConfig, callb
 // ExchangeCode exchanges an authorization code for user information.
 // Uses the default (CLI) client configuration for backward compatibility.
 func (s *OAuthService) ExchangeCode(ctx context.Context, provider, code, callbackURL string) (*OAuthUserInfo, error) {
-	return s.ExchangeCodeForClient(ctx, OAuthClientTypeCLI, provider, code, callbackURL)
+	return s.ExchangeCodeForClient(ctx, OAuthClientTypeCLI, provider, code, callbackURL, "", "")
 }
 
 // ExchangeCodeForClient exchanges an authorization code for user information
 // using the specified client type's configuration.
-func (s *OAuthService) ExchangeCodeForClient(ctx context.Context, clientType OAuthClientType, provider, code, callbackURL string) (*OAuthUserInfo, error) {
+// codeVerifier is the PKCE plain verifier (pass "" when not using PKCE).
+// callbackIss is the `iss` parameter from the OAuth callback (pass "" when absent).
+func (s *OAuthService) ExchangeCodeForClient(ctx context.Context, clientType OAuthClientType, provider, code, callbackURL, codeVerifier, callbackIss string) (*OAuthUserInfo, error) {
 	cfg := s.getClientConfig(clientType)
 
 	switch provider {
@@ -282,6 +346,8 @@ func (s *OAuthService) ExchangeCodeForClient(ctx context.Context, clientType OAu
 		return s.exchangeGoogleCodeWithConfig(ctx, cfg.Google, code, callbackURL)
 	case "github":
 		return s.exchangeGitHubCodeWithConfig(ctx, cfg.GitHub, code, callbackURL)
+	case hubclient.OAuthProviderGeneric:
+		return s.exchangeGenericCodeWithConfig(ctx, cfg.Generic, code, callbackURL, codeVerifier, callbackIss)
 	default:
 		return nil, fmt.Errorf("unsupported OAuth provider: %s", provider)
 	}
@@ -350,6 +416,7 @@ type tokenResponse struct {
 	ExpiresIn    int    `json:"expires_in"`
 	RefreshToken string `json:"refresh_token"`
 	Scope        string `json:"scope"`
+	IDToken      string `json:"id_token"`
 }
 
 // exchangeCodeForToken exchanges an authorization code for an access token (Google).
