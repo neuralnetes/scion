@@ -15,6 +15,7 @@
 package hub
 
 import (
+	"context"
 	"strings"
 	"testing"
 )
@@ -152,7 +153,7 @@ func TestOAuthService_GetAuthorizationURL(t *testing.T) {
 	service := NewOAuthService(config)
 
 	t.Run("google authorization URL", func(t *testing.T) {
-		url, err := service.GetAuthorizationURL("google", "http://localhost:18271/callback", "test-state")
+		url, err := service.GetAuthorizationURL(context.Background(), "google", "http://localhost:18271/callback", "test-state")
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -172,7 +173,7 @@ func TestOAuthService_GetAuthorizationURL(t *testing.T) {
 	})
 
 	t.Run("github authorization URL", func(t *testing.T) {
-		url, err := service.GetAuthorizationURL("github", "http://localhost:18271/callback", "test-state")
+		url, err := service.GetAuthorizationURL(context.Background(), "github", "http://localhost:18271/callback", "test-state")
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -189,7 +190,7 @@ func TestOAuthService_GetAuthorizationURL(t *testing.T) {
 	})
 
 	t.Run("unsupported provider", func(t *testing.T) {
-		_, err := service.GetAuthorizationURL("unknown", "http://localhost:18271/callback", "test-state")
+		_, err := service.GetAuthorizationURL(context.Background(), "unknown", "http://localhost:18271/callback", "test-state")
 		if err == nil {
 			t.Error("expected error for unsupported provider")
 		}
@@ -202,14 +203,14 @@ func TestOAuthService_NotConfigured(t *testing.T) {
 	service := NewOAuthService(config)
 
 	t.Run("google not configured", func(t *testing.T) {
-		_, err := service.GetAuthorizationURL("google", "http://localhost:18271/callback", "test-state")
+		_, err := service.GetAuthorizationURL(context.Background(), "google", "http://localhost:18271/callback", "test-state")
 		if err == nil {
 			t.Error("expected error when google is not configured")
 		}
 	})
 
 	t.Run("github not configured", func(t *testing.T) {
-		_, err := service.GetAuthorizationURL("github", "http://localhost:18271/callback", "test-state")
+		_, err := service.GetAuthorizationURL(context.Background(), "github", "http://localhost:18271/callback", "test-state")
 		if err == nil {
 			t.Error("expected error when github is not configured")
 		}
@@ -372,7 +373,7 @@ func TestOAuthService_GetAuthorizationURLForClient(t *testing.T) {
 	service := NewOAuthService(config)
 
 	t.Run("web client uses web config", func(t *testing.T) {
-		url, err := service.GetAuthorizationURLForClient(OAuthClientTypeWeb, "google", "http://example.com/callback", "test-state")
+		url, err := service.GetAuthorizationURLForClient(context.Background(), OAuthClientTypeWeb, "google", "http://example.com/callback", "test-state")
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -382,7 +383,7 @@ func TestOAuthService_GetAuthorizationURLForClient(t *testing.T) {
 	})
 
 	t.Run("cli client uses cli config", func(t *testing.T) {
-		url, err := service.GetAuthorizationURLForClient(OAuthClientTypeCLI, "google", "http://localhost:18271/callback", "test-state")
+		url, err := service.GetAuthorizationURLForClient(context.Background(), OAuthClientTypeCLI, "google", "http://localhost:18271/callback", "test-state")
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -392,7 +393,7 @@ func TestOAuthService_GetAuthorizationURLForClient(t *testing.T) {
 	})
 
 	t.Run("device client uses device config", func(t *testing.T) {
-		url, err := service.GetAuthorizationURLForClient(OAuthClientTypeDevice, "google", "http://localhost:18271/callback", "test-state")
+		url, err := service.GetAuthorizationURLForClient(context.Background(), OAuthClientTypeDevice, "google", "http://localhost:18271/callback", "test-state")
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
