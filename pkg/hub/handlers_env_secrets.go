@@ -19,10 +19,14 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
+	"github.com/GoogleCloudPlatform/scion/pkg/config"
 	"github.com/GoogleCloudPlatform/scion/pkg/secret"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 )
@@ -1625,6 +1629,27 @@ func (s *Server) addProjectProvider(w http.ResponseWriter, r *http.Request, proj
 		linkedBy = user.ID()
 	}
 
+	// Validate LocalPath before persisting — fail fast before touching the DB.
+	var cleanPath string
+	if req.LocalPath != "" {
+		cleanPath = filepath.Clean(req.LocalPath)
+		if !filepath.IsAbs(cleanPath) {
+			ValidationError(w, "localPath must be an absolute path", nil)
+			return
+		}
+		for _, prefix := range []string{"/etc", "/usr", "/bin", "/sbin", "/sys", "/proc", "/dev", "/boot", "/lib"} {
+			if cleanPath == prefix || strings.HasPrefix(cleanPath, prefix+"/") {
+				ValidationError(w, "localPath points to a restricted system directory", nil)
+				return
+			}
+		}
+		info, err := os.Stat(cleanPath)
+		if err != nil || !info.IsDir() {
+			ValidationError(w, "localPath must be an existing directory", nil)
+			return
+		}
+	}
+
 	// Create provider record
 	provider := &store.ProjectProvider{
 		ProjectID:  projectID,
@@ -1638,6 +1663,16 @@ func (s *Server) addProjectProvider(w http.ResponseWriter, r *http.Request, proj
 	if err := s.store.AddProjectProvider(ctx, provider); err != nil {
 		writeErrorFromErr(w, err, "")
 		return
+	}
+
+	// For linked projects (local directory), initialize the .scion directory
+	// so agents and templates directories exist before the first agent starts.
+	if cleanPath != "" {
+		scionDir := filepath.Join(cleanPath, ".scion")
+		if err := config.InitProject(scionDir, nil, config.InitProjectOpts{SkipRuntimeCheck: true}); err != nil {
+			slog.Warn("failed to initialize .scion in linked project",
+				"project_id", projectID, "localPath", cleanPath, "error", err.Error())
+		}
 	}
 
 	// Get the project to check if we should set default runtime broker
