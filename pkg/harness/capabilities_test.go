@@ -44,10 +44,12 @@ func TestAdvancedCapabilitiesDefaults(t *testing.T) {
 			expectResume:        api.SupportYes,
 		},
 		{
+			// Claude capabilities come from harnesses/claude/config.yaml
+			// via DeclarativeGenericHarness loaded from the embed FS.
 			name:                "claude",
 			harness:             "claude",
 			expectMaxTurns:      api.SupportYes,
-			expectMaxModelCalls: api.SupportYes,
+			expectMaxModelCalls: api.SupportNo,
 			expectMaxDuration:   api.SupportYes,
 			expectAuthFile:      api.SupportYes,
 			expectVertexAI:      api.SupportYes,

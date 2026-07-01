@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package claude
+package harnesses
 
 import "embed"
 
-//go:embed all:embeds/*
-var EmbedsFS embed.FS
+//go:embed all:antigravity/* all:claude/* all:codex/* all:copilot/* all:hermes/* all:opencode/*
+var FS embed.FS

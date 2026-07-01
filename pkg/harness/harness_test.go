@@ -21,18 +21,13 @@ import (
 )
 
 func TestNew_BuiltinHarnesses(t *testing.T) {
-	tests := []struct {
-		name     string
-		expected string
-	}{
-		{"claude", "claude"},
-		{"gemini", "gemini"},
-	}
+	// Gemini is the only remaining builtin harness
+	h := New("gemini")
+	assert.Equal(t, "gemini", h.Name())
 
-	for _, tt := range tests {
-		h := New(tt.name)
-		assert.Equal(t, tt.expected, h.Name())
-	}
+	// Claude loads from the harnesses/ embed FS as a DeclarativeGenericHarness
+	h = New("claude")
+	assert.Equal(t, "claude", h.Name())
 }
 
 func TestNew_UnknownFallsToGeneric(t *testing.T) {
@@ -40,13 +35,19 @@ func TestNew_UnknownFallsToGeneric(t *testing.T) {
 	assert.Equal(t, "generic", h.Name())
 }
 
-func TestAll_ReturnsBuiltins(t *testing.T) {
-	all := All()
-	assert.Len(t, all, 2)
-	names := make([]string, len(all))
-	for i, h := range all {
-		names[i] = h.Name()
-	}
-	assert.Contains(t, names, "gemini")
+func TestEmbedOnlyHarnesses_ReturnsGemini(t *testing.T) {
+	all := EmbedOnlyHarnesses()
+	assert.Len(t, all, 1)
+	assert.Equal(t, "gemini", all[0].Name())
+}
+
+func TestAllHarnessNames_IncludesAll(t *testing.T) {
+	names := AllHarnessNames()
 	assert.Contains(t, names, "claude")
+	assert.Contains(t, names, "gemini")
+	assert.Contains(t, names, "codex")
+	assert.Contains(t, names, "opencode")
+	assert.Contains(t, names, "antigravity")
+	assert.Contains(t, names, "copilot")
+	assert.Contains(t, names, "hermes")
 }
