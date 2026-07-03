@@ -291,6 +291,10 @@ func (s *Server) computeOnboardingStatus(ctx context.Context) OnboardingStatus {
 	if vs, loadErr := config.LoadSingleFileVersioned(globalDir); loadErr == nil && vs != nil {
 		status.ImageRegistry = vs.ResolveImageRegistry("")
 	}
+	// TODO: use an internal settings API when available (needed for HA/DB-backed settings)
+	if envRegistry := os.Getenv("SCION_IMAGE_REGISTRY"); envRegistry != "" {
+		status.ImageRegistry = envRegistry
+	}
 
 	// BuildAvailable: true only if the build script can be resolved
 	status.BuildAvailable = resolveBuildScript() != ""
@@ -466,6 +470,10 @@ func (s *Server) handleSystemImagesPull(w http.ResponseWriter, r *http.Request) 
 		if vs, loadErr := config.LoadSingleFileVersioned(globalDir); loadErr == nil && vs != nil {
 			registry = vs.ResolveImageRegistry("")
 		}
+	}
+	// TODO: use an internal settings API when available (needed for HA/DB-backed settings)
+	if envRegistry := os.Getenv("SCION_IMAGE_REGISTRY"); envRegistry != "" {
+		registry = envRegistry
 	}
 	if registry == "" {
 		s.imagePullActive.Store(false)
