@@ -71,10 +71,10 @@ capabilities:
   resume: { support: "yes" }
 no_auth:
   behavior: drop-to-shell
-  command: claude login
+  command: claude setup-token
   message: |
     This agent started without credentials.
-    Run: claude login
+    Run: claude setup-token
     Then run: python3 /home/scion/.scion/harness/capture_auth.py
 auth:
   default_type: api-key
