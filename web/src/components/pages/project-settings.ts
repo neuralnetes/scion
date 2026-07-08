@@ -25,6 +25,7 @@ import { customElement, property, state } from 'lit/decorators.js';
 
 import type { PageData, Project, Template, AdminGroup, GitHubAppProjectStatus, GitHubTokenPermissions, RuntimeBroker, BrokerProfile, GCPServiceAccount } from '../../shared/types.js';
 import { can, canAny } from '../../shared/types.js';
+import { normalizeModelAlias } from '../../shared/model-utils.js';
 import { apiFetch, extractApiError } from '../../client/api.js';
 import { dispatchPageTitle } from '../../client/page-title.js';
 import '../shared/env-var-list.js';
@@ -56,6 +57,7 @@ interface ProjectSettings {
   defaultResources?: ProjectResourceSpec | undefined;
   defaultGCPIdentityMode?: string | undefined;
   defaultGCPIdentityServiceAccountID?: string | undefined;
+  defaultModel?: string | undefined;
 }
 
 interface HarnessConfigEntry {
@@ -168,6 +170,12 @@ export class ScionPageProjectSettings extends LitElement {
 
   @state()
   private configDefaultGCPIdentitySAID = '';
+
+  @state()
+  private defaultModelSelection: '' | 'small' | 'medium' | 'large' | 'extra-large' | 'other' = '';
+
+  @state()
+  private defaultCustomModelId = '';
 
   @state()
   private gcpServiceAccounts: GCPServiceAccount[] = [];
@@ -874,6 +882,17 @@ export class ScionPageProjectSettings extends LitElement {
         this.configDefaultResDisk = res?.disk || '';
         this.configDefaultGCPIdentityMode = this.settings.defaultGCPIdentityMode || '';
         this.configDefaultGCPIdentitySAID = this.settings.defaultGCPIdentityServiceAccountID || '';
+        if (this.settings.defaultModel) {
+          const dm = normalizeModelAlias(this.settings.defaultModel);
+          if (['small', 'medium', 'large', 'extra-large'].includes(dm)) {
+            this.defaultModelSelection = dm as 'small' | 'medium' | 'large' | 'extra-large';
+          } else {
+            this.defaultModelSelection = 'other';
+            this.defaultCustomModelId = this.settings.defaultModel;
+          }
+        } else {
+          this.defaultModelSelection = '';
+        }
       }
     } catch (err) {
       console.error('Failed to load project settings:', err);
@@ -955,9 +974,14 @@ export class ScionPageProjectSettings extends LitElement {
         }
       }
 
+      const defaultModel = this.defaultModelSelection === 'other'
+        ? this.defaultCustomModelId
+        : this.defaultModelSelection;
+
       const body: ProjectSettings = {
         defaultTemplate: this.configDefaultTemplate || undefined,
         defaultHarnessConfig: this.configDefaultHarnessConfig || undefined,
+        defaultModel: defaultModel || undefined,
         telemetryEnabled: this.configTelemetryEnabled,
         defaultMaxTurns: this.configDefaultMaxTurns || undefined,
         defaultMaxModelCalls: this.configDefaultMaxModelCalls || undefined,
@@ -1450,6 +1474,46 @@ export class ScionPageProjectSettings extends LitElement {
                   >Harness configuration used by default for new agents.</span
                 >
               </div>
+
+              <div class="config-field">
+                <label>Default Model</label>
+                <sl-select
+                  placeholder="None (use server default)"
+                  clearable
+                  value=${this.defaultModelSelection}
+                  ?disabled=${!canEdit}
+                  @sl-change=${(e: Event) => {
+                    const val = (e.target as HTMLSelectElement).value as '' | 'small' | 'medium' | 'large' | 'extra-large' | 'other';
+                    this.defaultModelSelection = val;
+                    if (val !== 'other') this.defaultCustomModelId = '';
+                  }}
+                >
+                  <sl-option value="small">Small</sl-option>
+                  <sl-option value="medium">Medium</sl-option>
+                  <sl-option value="large">Large</sl-option>
+                  <sl-option value="extra-large">Extra Large</sl-option>
+                  <sl-option value="other">Other (specify)</sl-option>
+                </sl-select>
+                <span class="field-help"
+                  >Default model alias or ID used for new agents.</span
+                >
+              </div>
+
+              ${this.defaultModelSelection === 'other'
+                ? html`
+                    <div class="config-field">
+                      <label>Model ID</label>
+                      <sl-input
+                        placeholder="e.g. claude-opus-4-8"
+                        .value=${this.defaultCustomModelId}
+                        ?disabled=${!canEdit}
+                        @sl-input=${(e: Event) => {
+                          this.defaultCustomModelId = (e.target as HTMLInputElement).value;
+                        }}
+                      ></sl-input>
+                    </div>
+                  `
+                : ''}
 
               <div class="config-field">
                 <label>Telemetry</label>
