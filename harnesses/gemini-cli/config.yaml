@@ -13,7 +13,7 @@
 # limitations under the License.
 
 harness: gemini-cli
-image: scion-gemini:latest
+image: scion-gemini-cli:latest
 user: scion
 provisioner:
   type: container-script
