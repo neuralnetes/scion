@@ -20,6 +20,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -699,14 +700,25 @@ func (s *Server) handleListAvailableIntegrations(w http.ResponseWriter, _ *http.
 		if mgr != nil && mgr.HasPlugin("broker", name) {
 			continue
 		}
+
+		binaryName := "scion-plugin-" + name
+
+		// Check 1: binary is on $PATH (covers Homebrew / package-manager installs).
+		_, onPathErr := exec.LookPath(binaryName)
+
+		// Check 2: source checkout exists (covers development installs).
+		inSourceCheckout := false
 		if repoPath != "" {
 			sourceDir := filepath.Join(repoPath, "extras", "scion-"+name)
-			if _, err := os.Stat(sourceDir); err != nil {
-				continue
+			if _, err := os.Stat(sourceDir); err == nil {
+				inSourceCheckout = true
 			}
-		} else {
-			continue
 		}
+
+		if onPathErr != nil && !inSourceCheckout {
+			continue // neither binary on PATH nor source checkout found
+		}
+
 		available = append(available, AvailableIntegration{
 			Name:     name,
 			Platform: resolvePlatform(name),
