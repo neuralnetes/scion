@@ -17,6 +17,7 @@ package opsettings
 import (
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"strings"
 
 	"github.com/knadh/koanf/providers/confmap"
@@ -297,17 +298,12 @@ func EnvOverriddenLayer1Keys(envKeys []string) []string {
 	return overridden
 }
 
-// DetectEnvOverrides creates a koanf instance from the SCION_ environment
-// variables and returns which Layer-1 keys are overridden by env.
-// The envMapper should be the same mapper used by the main config loader.
+// DetectEnvOverrides returns all koanf keys present in the SCION_SERVER_*
+// env koanf. This includes Layer-0 and Layer-1 keys alike — the caller
+// uses the list to show which fields are env-pinned in the admin UI
+// (both file-mode and DB-mode).
 func DetectEnvOverrides(envKoanf *koanf.Koanf) []string {
-	var overridden []string
-	for _, key := range envKoanf.Keys() {
-		if IsLayer1Key(key) {
-			overridden = append(overridden, key)
-		}
-	}
-	return overridden
+	return envKoanf.Keys()
 }
 
 // ExtractAllSections extracts all registered section documents from a fully
@@ -365,4 +361,102 @@ func ClassifyKeys(keys []string) (layer1 map[string][]string, layer0 []string, u
 		}
 	}
 	return layer1, layer0, unclassified
+}
+
+// koanfPathToJSONKey is the reverse of jsonFieldToKoanfPaths: koanf path → JSON field name.
+var koanfPathToJSONKey map[string]string
+
+func init() {
+	koanfPathToJSONKey = make(map[string]string)
+	for _, fields := range jsonFieldToKoanfPaths {
+		for jsonKey, kp := range fields {
+			koanfPathToJSONKey[kp] = jsonKey
+		}
+	}
+}
+
+// SectionKeyFromKoanfPath returns the JSON field name (section-level key) for a
+// given koanf path, or empty string if the path is not in the registry.
+func SectionKeyFromKoanfPath(koanfPath string) string {
+	return koanfPathToJSONKey[koanfPath]
+}
+
+// KoanfPathFromSectionKey returns the full koanf path for a section-level JSON
+// key, or empty string if no mapping exists for the given section/key pair.
+func KoanfPathFromSectionKey(sectionName, jsonKey string) string {
+	if mapping, ok := jsonFieldToKoanfPaths[sectionName]; ok {
+		return mapping[jsonKey]
+	}
+	return ""
+}
+
+// DeprecatedEnvVar describes a SCION_SERVER_* environment variable that targets
+// a Layer-1 key and should be migrated to SCION_SEED_*.
+type DeprecatedEnvVar struct {
+	EnvVar         string // e.g. "SCION_SERVER_HUB_ADMINEMAILS"
+	KoanfKey       string // e.g. "server.hub.admin_emails"
+	SeedEquivalent string // e.g. "SCION_SEED_SERVER_HUB_ADMINEMAILS"
+}
+
+// DetectDeprecatedServerEnv inspects a koanf instance loaded from SCION_SERVER_*
+// env vars and returns entries for any that resolve to Layer-1 keys. These vars
+// should be migrated to SCION_SEED_*. The caller is responsible for logging
+// the returned entries (typically once at startup).
+//
+// envVarPrefix is the raw env prefix used (e.g. "SCION_SERVER_").
+func DetectDeprecatedServerEnv(serverEnvKoanf *koanf.Koanf) []DeprecatedEnvVar {
+	var deprecated []DeprecatedEnvVar
+	for _, key := range serverEnvKoanf.Keys() {
+		if !IsLayer1Key(key) {
+			continue
+		}
+		// koanfKeyToEnvSuffix strips the "server." prefix, so the suffix
+		// is e.g. "HUB_ADMINEMAILS" for key "server.hub.admin_emails".
+		envSuffix := koanfKeyToEnvSuffix(key)
+
+		// SEED prefix depends on whether the key lives under server.*:
+		// - server.hub.admin_emails → SCION_SEED_SERVER_HUB_ADMINEMAILS
+		//   (strips SCION_SEED_ → SERVER_HUB_ADMINEMAILS → server.hub.admin_emails)
+		// - telemetry.enabled → SCION_SEED_TELEMETRY_ENABLED
+		//   (strips SCION_SEED_ → TELEMETRY_ENABLED → telemetry.enabled)
+		var seedPrefix string
+		if strings.HasPrefix(key, "server.") {
+			seedPrefix = "SCION_SEED_SERVER_"
+		} else {
+			seedPrefix = "SCION_SEED_"
+		}
+		deprecated = append(deprecated, DeprecatedEnvVar{
+			EnvVar:         "SCION_SERVER_" + envSuffix,
+			KoanfKey:       key,
+			SeedEquivalent: seedPrefix + envSuffix,
+		})
+	}
+	return deprecated
+}
+
+// koanfKeyToEnvSuffix converts a koanf key back to the env var suffix form.
+// e.g. "server.hub.admin_emails" → "HUB_ADMINEMAILS"
+// The "server." prefix is stripped because it corresponds to the SCION_SERVER_
+// env prefix that was already removed during key mapping. Without stripping,
+// the output would produce double-SERVER var names (SCION_SERVER_SERVER_HUB_...).
+func koanfKeyToEnvSuffix(key string) string {
+	key = strings.TrimPrefix(key, "server.")
+	parts := strings.Split(key, ".")
+	for i, part := range parts {
+		parts[i] = strings.ToUpper(strings.ReplaceAll(part, "_", ""))
+	}
+	return strings.Join(parts, "_")
+}
+
+// LogDeprecatedServerEnv logs a warning for each deprecated SCION_SERVER_* var
+// targeting a Layer-1 key. Call once at startup.
+func LogDeprecatedServerEnv(serverEnvKoanf *koanf.Koanf, logger *slog.Logger) {
+	deprecated := DetectDeprecatedServerEnv(serverEnvKoanf)
+	for _, d := range deprecated {
+		logger.Warn("SCION_SERVER_* is deprecated for operational settings; use SCION_SEED_*",
+			"env_var", d.EnvVar,
+			"koanf_key", d.KoanfKey,
+			"seed_equivalent", d.SeedEquivalent,
+		)
+	}
 }

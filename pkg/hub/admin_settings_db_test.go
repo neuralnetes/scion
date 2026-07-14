@@ -537,7 +537,7 @@ func TestPutServerConfigDB_SchemaValidationFailure_NothingWritten(t *testing.T) 
 	// Actually, Go's json decoder is loose with types, so we use a different
 	// approach: directly call Update with a bad doc to test schema validation.
 	badDoc := json.RawMessage(`{"admin_emails": "not-an-array"}`)
-	_, err := ops.Update(context.Background(), "access", badDoc, "test@user.com", -1)
+	_, err := ops.Update(context.Background(), "access", badDoc, "test@user.com", -1, "managed")
 	if err == nil {
 		t.Fatal("expected validation error for bad access doc, got nil")
 	}
@@ -764,23 +764,23 @@ func TestGetMaintenanceDB_ReflectsSnapshot(t *testing.T) {
 	}
 }
 
-func TestMaintenanceDB_EnvOverrideStillWins(t *testing.T) {
+func TestMaintenanceDB_EnvDoesNotOverrideDB(t *testing.T) {
 	srv, fakeStore, ops := newTestDBServer(t)
 
 	// DB says maintenance off.
 	fakeStore.seed("maintenance", json.RawMessage(`{"admin_mode":false}`))
 	_, _ = ops.Refresh(context.Background())
 
-	// But env says on.
+	// Env says on — but per B3 redesign, env no longer force-wins for
+	// maintenance. DB is authoritative in HA mode.
 	t.Setenv("SCION_SERVER_ADMIN_MODE", "true")
 
-	// Apply snapshot with env override.
 	snap := ops.Snapshot()
 	ApplyMaintenanceFromSnapshot(srv, snap)
 
-	// Server should be in maintenance due to env override.
-	if !srv.maintenance.IsEnabled() {
-		t.Error("expected maintenance enabled due to env override")
+	// Server should NOT be in maintenance — DB wins.
+	if srv.maintenance.IsEnabled() {
+		t.Error("expected maintenance disabled — DB wins over env in HA mode")
 	}
 }
 
@@ -814,8 +814,55 @@ func TestFileMode_ServerConfigDispatch(t *testing.T) {
 	if _, ok := resp["section_metadata"]; ok {
 		t.Error("file mode should not include section_metadata")
 	}
-	if _, ok := resp["env_overrides"]; ok {
-		t.Error("file mode should not include env_overrides")
+	// env_overrides IS included in file mode when SCION_SERVER_* vars are set
+	// (H1 fix). Without env vars, it's omitted.
+}
+
+func TestFileMode_EnvOverrides(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Setenv("HOME", tmpDir)
+	t.Setenv("SCION_SERVER_HUB_ADMINEMAILS", "admin@test.com")
+	t.Setenv("SCION_SERVER_DATABASE_DRIVER", "postgres")
+
+	srv := &Server{
+		maintenance: NewMaintenanceState(false, ""),
+	}
+
+	admin := NewAuthenticatedUser("u1", "admin@example.com", "Admin", "admin", "cli")
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/server-config", nil)
+	req = req.WithContext(contextWithIdentity(req.Context(), admin))
+	rr := httptest.NewRecorder()
+	srv.handleAdminServerConfig(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("file-mode GET: expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	var resp map[string]interface{}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("json.Unmarshal: %v", err)
+	}
+
+	overrides, ok := resp["env_overrides"]
+	if !ok {
+		t.Fatal("file-mode response should include env_overrides when SCION_SERVER_* vars are set")
+	}
+
+	overrideList, ok := overrides.([]interface{})
+	if !ok {
+		t.Fatalf("env_overrides should be an array, got %T", overrides)
+	}
+
+	found := make(map[string]bool)
+	for _, v := range overrideList {
+		found[v.(string)] = true
+	}
+
+	if !found["server.hub.admin_emails"] {
+		t.Error("expected server.hub.admin_emails in env_overrides")
+	}
+	if !found["server.database.driver"] {
+		t.Error("expected server.database.driver in env_overrides (all env keys reported)")
 	}
 }
 
@@ -1189,6 +1236,269 @@ func TestGetServerConfigDB_MasksGitHubAppSecrets(t *testing.T) {
 	// Handler calls maskSensitiveFields — if it reaches here without panic, masking ran.
 }
 
+// ---- B3: Provenance API tests ----
+
+func TestGetServerConfigDB_SettingsTierIsDB(t *testing.T) {
+	srv, _, ops := newTestDBServer(t)
+
+	rr := httptest.NewRecorder()
+	srv.handleGetServerConfigDB(rr, adminRequest(http.MethodGet, "/api/v1/admin/server-config", ""), ops)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	var resp map[string]interface{}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	if resp["settings_tier"] != "db" {
+		t.Errorf("settings_tier: want 'db', got %v", resp["settings_tier"])
+	}
+}
+
+func TestGetServerConfigDB_OriginInSectionMetadata(t *testing.T) {
+	fakeStore := newFakeHubSettingStore()
+	fileK := emptyKoanf()
+	envK := emptyKoanf()
+	ops := NewOperationalSettings(fakeStore, fileK, envK)
+
+	// Seed a section with "seeded" origin and another with "managed" origin.
+	fakeStore.seedWithOrigin("access", json.RawMessage(`{"admin_emails":["a@test.com"]}`), "seeded")
+	fakeStore.seedWithOrigin("maintenance", json.RawMessage(`{"admin_mode":false}`), "managed")
+	_, _ = ops.Refresh(context.Background())
+
+	srv := &Server{
+		dbDriver:    "postgres",
+		maintenance: NewMaintenanceState(false, ""),
+	}
+	srv.SetOperationalSettings(ops)
+
+	rr := httptest.NewRecorder()
+	srv.handleGetServerConfigDB(rr, adminRequest(http.MethodGet, "/api/v1/admin/server-config", ""), ops)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	var resp ServerConfigDBResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	accessMeta := resp.SectionMeta["access"]
+	if accessMeta.Origin != "seeded" {
+		t.Errorf("access origin: want 'seeded', got %q", accessMeta.Origin)
+	}
+
+	maintMeta := resp.SectionMeta["maintenance"]
+	if maintMeta.Origin != "managed" {
+		t.Errorf("maintenance origin: want 'managed', got %q", maintMeta.Origin)
+	}
+
+	// Sections without DB rows should have no origin.
+	lifecycleMeta := resp.SectionMeta["lifecycle"]
+	if lifecycleMeta.Origin != "" {
+		t.Errorf("lifecycle origin: want empty, got %q", lifecycleMeta.Origin)
+	}
+}
+
+func TestGetServerConfigDB_SupersededKeys(t *testing.T) {
+	fakeStore := newFakeHubSettingStore()
+
+	// Bootstrap koanf has admin_emails from bootstrap merge.
+	bootstrapK := newFileKoanf(t, map[string]interface{}{
+		"server.hub.admin_emails":      []interface{}{"bootstrap@example.com"},
+		"server.auth.user_access_mode": "open",
+	})
+	envK := emptyKoanf()
+	ops := NewOperationalSettings(fakeStore, bootstrapK, envK)
+
+	// Seed access as "managed" with different admin_emails (DB wins, bootstrap is superseded).
+	fakeStore.seedWithOrigin("access", json.RawMessage(`{"admin_emails":["admin@db.com"],"user_access_mode":"open"}`), "managed")
+	_, _ = ops.Refresh(context.Background())
+
+	srv := &Server{
+		dbDriver:    "postgres",
+		maintenance: NewMaintenanceState(false, ""),
+	}
+	srv.SetOperationalSettings(ops)
+
+	rr := httptest.NewRecorder()
+	srv.handleGetServerConfigDB(rr, adminRequest(http.MethodGet, "/api/v1/admin/server-config", ""), ops)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	var resp ServerConfigDBResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	// admin_emails differs between bootstrap (["bootstrap@example.com"]) and
+	// DB (["admin@db.com"]), so it should appear in superseded_keys for "access".
+	// user_access_mode is "open" in both → NOT superseded.
+	// Keys must be full koanf paths so the frontend can match them.
+	accessSup, ok := resp.SupersededKeys["access"]
+	if !ok {
+		t.Fatal("expected superseded_keys entry for 'access'")
+	}
+
+	found := false
+	for _, sk := range accessSup {
+		if sk.Key == "server.hub.admin_emails" {
+			found = true
+			if sk.Source != "yaml" {
+				t.Errorf("admin_emails source: want 'yaml', got %q", sk.Source)
+			}
+		}
+		if sk.Key == "admin_emails" {
+			t.Error("superseded key should use full koanf path, not section-level JSON key")
+		}
+		if sk.Key == "server.auth.user_access_mode" || sk.Key == "user_access_mode" {
+			t.Error("user_access_mode should NOT be superseded (values match)")
+		}
+	}
+	if !found {
+		t.Errorf("expected server.hub.admin_emails in superseded_keys, got %+v", accessSup)
+	}
+}
+
+func TestGetServerConfigDB_SupersededKeys_SeededSectionExcluded(t *testing.T) {
+	fakeStore := newFakeHubSettingStore()
+	bootstrapK := newFileKoanf(t, map[string]interface{}{
+		"server.hub.admin_emails": []interface{}{"bootstrap@example.com"},
+	})
+	envK := emptyKoanf()
+	ops := NewOperationalSettings(fakeStore, bootstrapK, envK)
+
+	// Seed access as "seeded" — superseded keys only apply to "managed" sections.
+	fakeStore.seedWithOrigin("access", json.RawMessage(`{"admin_emails":["admin@db.com"]}`), "seeded")
+	_, _ = ops.Refresh(context.Background())
+
+	srv := &Server{
+		dbDriver:    "postgres",
+		maintenance: NewMaintenanceState(false, ""),
+	}
+	srv.SetOperationalSettings(ops)
+
+	rr := httptest.NewRecorder()
+	srv.handleGetServerConfigDB(rr, adminRequest(http.MethodGet, "/api/v1/admin/server-config", ""), ops)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	var resp ServerConfigDBResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	// Seeded sections should not have superseded keys.
+	if resp.SupersededKeys != nil {
+		if _, ok := resp.SupersededKeys["access"]; ok {
+			t.Error("seeded sections should not appear in superseded_keys")
+		}
+	}
+}
+
+func TestGetServerConfigDB_DeprecatedEnvKeys(t *testing.T) {
+	fakeStore := newFakeHubSettingStore()
+	bootstrapK := emptyKoanf()
+
+	// envKoanf with a SCION_SERVER_* var targeting a Layer-1 key.
+	envK := newEnvKoanf(t, map[string]interface{}{
+		"server.hub.admin_emails": []interface{}{"env@example.com"},
+	})
+	ops := NewOperationalSettings(fakeStore, bootstrapK, envK)
+	_, _ = ops.Refresh(context.Background())
+
+	srv := &Server{
+		dbDriver:    "postgres",
+		maintenance: NewMaintenanceState(false, ""),
+	}
+	srv.SetOperationalSettings(ops)
+
+	rr := httptest.NewRecorder()
+	srv.handleGetServerConfigDB(rr, adminRequest(http.MethodGet, "/api/v1/admin/server-config", ""), ops)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	var resp ServerConfigDBResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	if len(resp.DeprecatedEnvKeys) == 0 {
+		t.Fatal("expected non-empty deprecated_env_keys")
+	}
+
+	found := false
+	for _, d := range resp.DeprecatedEnvKeys {
+		if d.KoanfKey == "server.hub.admin_emails" {
+			found = true
+			if d.SeedEquivalent == "" {
+				t.Error("expected non-empty seed_equivalent")
+			}
+			if d.EnvVar == "" {
+				t.Error("expected non-empty env_var")
+			}
+		}
+	}
+	if !found {
+		t.Errorf("expected server.hub.admin_emails in deprecated_env_keys, got %+v", resp.DeprecatedEnvKeys)
+	}
+}
+
+func TestGetServerConfigDB_DeprecatedEnvKeys_EmptyWhenNoServerEnvVars(t *testing.T) {
+	srv, _, ops := newTestDBServer(t)
+
+	rr := httptest.NewRecorder()
+	srv.handleGetServerConfigDB(rr, adminRequest(http.MethodGet, "/api/v1/admin/server-config", ""), ops)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	var resp ServerConfigDBResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	if len(resp.DeprecatedEnvKeys) != 0 {
+		t.Errorf("expected no deprecated_env_keys, got %+v", resp.DeprecatedEnvKeys)
+	}
+}
+
+func TestFileMode_SettingsTierIsFile(t *testing.T) {
+	srv := &Server{
+		maintenance: NewMaintenanceState(false, ""),
+	}
+
+	admin := NewAuthenticatedUser("u1", "admin@example.com", "Admin", "admin", "cli")
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/server-config", nil)
+	req = req.WithContext(contextWithIdentity(req.Context(), admin))
+	rr := httptest.NewRecorder()
+	srv.handleAdminServerConfig(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	var resp map[string]interface{}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	if resp["settings_tier"] != "file" {
+		t.Errorf("file mode settings_tier: want 'file', got %v", resp["settings_tier"])
+	}
+}
+
 // ---- N2: Extract server.env and auth.DevMode tests ----
 
 func TestExtractKoanfKeys_ServerEnv_IsLayer0(t *testing.T) {
@@ -1556,7 +1866,7 @@ func TestPutServerConfigDB_CAS_MultiSection_PartialApply(t *testing.T) {
 
 	// Advance lifecycle to revision 2 so our expected_revision of 1 is stale.
 	_, _ = ops.Update(context.Background(), "lifecycle",
-		json.RawMessage(`{"soft_delete_retention":"48h"}`), "other@test.com", -1)
+		json.RawMessage(`{"soft_delete_retention":"48h"}`), "other@test.com", -1, "managed")
 
 	// PUT both sections: access with correct rev (1), lifecycle with stale rev (1).
 	// Sections are written alphabetically: access first (succeeds), lifecycle second (conflicts).
@@ -1712,5 +2022,252 @@ func TestGetServerConfigSchema_MethodNotAllowed(t *testing.T) {
 
 	if rr.Code != http.StatusMethodNotAllowed {
 		t.Errorf("expected 405 for POST, got %d", rr.Code)
+	}
+}
+
+// ---- #391: Boolean and field-clearing round-trip correctness ----
+
+func TestRoundTrip_AutoSuspendStalled_TruePersists(t *testing.T) {
+	srv, _, ops := newTestDBServer(t)
+
+	body := `{
+		"server": {
+			"hub": {"auto_suspend_stalled": true}
+		}
+	}`
+	req := adminRequest(http.MethodPut, "/api/v1/admin/server-config", body)
+	rr := httptest.NewRecorder()
+	srv.handlePutServerConfigDB(rr, req, ops)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("PUT: expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	snap := ops.Snapshot()
+	if !snap.AutoSuspendStalled {
+		t.Error("#391: AutoSuspendStalled should be true after saving true")
+	}
+}
+
+func TestRoundTrip_AutoSuspendStalled_FalsePersists(t *testing.T) {
+	srv, fakeStore, ops := newTestDBServer(t)
+
+	// First set it to true.
+	fakeStore.seed("lifecycle", json.RawMessage(`{"auto_suspend_stalled":true}`))
+	_, _ = ops.Refresh(context.Background())
+	if !ops.Snapshot().AutoSuspendStalled {
+		t.Fatal("precondition: AutoSuspendStalled should be true")
+	}
+
+	// Now set it to false.
+	body := `{
+		"server": {
+			"hub": {"auto_suspend_stalled": false}
+		}
+	}`
+	req := adminRequest(http.MethodPut, "/api/v1/admin/server-config", body)
+	rr := httptest.NewRecorder()
+	srv.handlePutServerConfigDB(rr, req, ops)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("PUT: expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	snap := ops.Snapshot()
+	if snap.AutoSuspendStalled {
+		t.Error("#391: AutoSuspendStalled should be false after saving false, not reverted to default/true")
+	}
+}
+
+func TestRoundTrip_AdminEmails_SetThenClear(t *testing.T) {
+	srv, _, ops := newTestDBServer(t)
+
+	// Step 1: Set admin_emails to ["a@b.com"].
+	body := `{
+		"server": {
+			"hub": {"admin_emails": ["a@b.com"]},
+			"auth": {"user_access_mode": "open"}
+		}
+	}`
+	req := adminRequest(http.MethodPut, "/api/v1/admin/server-config", body)
+	rr := httptest.NewRecorder()
+	srv.handlePutServerConfigDB(rr, req, ops)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("PUT(set): expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	snap := ops.Snapshot()
+	if len(snap.AdminEmails) != 1 || snap.AdminEmails[0] != "a@b.com" {
+		t.Fatalf("precondition: AdminEmails should be [a@b.com], got %v", snap.AdminEmails)
+	}
+
+	// Step 2: Clear admin_emails to [].
+	body = `{
+		"server": {
+			"hub": {"admin_emails": []},
+			"auth": {"user_access_mode": "open"}
+		}
+	}`
+	req = adminRequest(http.MethodPut, "/api/v1/admin/server-config", body)
+	rr = httptest.NewRecorder()
+	srv.handlePutServerConfigDB(rr, req, ops)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("PUT(clear): expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	snap = ops.Snapshot()
+	if len(snap.AdminEmails) != 0 {
+		t.Errorf("#391: AdminEmails should be empty after clearing to [], got %v", snap.AdminEmails)
+	}
+}
+
+func TestRoundTrip_TelemetryEnabled_FalsePersists(t *testing.T) {
+	srv, _, ops := newTestDBServer(t)
+
+	// Step 1: Set telemetry.enabled to true.
+	body := `{
+		"telemetry": {"enabled": true}
+	}`
+	req := adminRequest(http.MethodPut, "/api/v1/admin/server-config", body)
+	rr := httptest.NewRecorder()
+	srv.handlePutServerConfigDB(rr, req, ops)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("PUT(true): expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	snap := ops.Snapshot()
+	if snap.TelemetryConfig == nil || snap.TelemetryConfig.Enabled == nil || !*snap.TelemetryConfig.Enabled {
+		t.Fatal("precondition: telemetry.enabled should be true")
+	}
+
+	// Step 2: Set telemetry.enabled to false.
+	body = `{
+		"telemetry": {"enabled": false}
+	}`
+	req = adminRequest(http.MethodPut, "/api/v1/admin/server-config", body)
+	rr = httptest.NewRecorder()
+	srv.handlePutServerConfigDB(rr, req, ops)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("PUT(false): expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	snap = ops.Snapshot()
+	if snap.TelemetryConfig == nil || snap.TelemetryConfig.Enabled == nil {
+		t.Fatal("#391: telemetry.enabled should not be nil after saving false")
+	}
+	if *snap.TelemetryConfig.Enabled {
+		t.Error("#391: telemetry.enabled should be false after saving false, not reverted to default/true")
+	}
+}
+
+func TestRoundTrip_WebhooksEnabled_FalsePersists(t *testing.T) {
+	srv, fakeStore, ops := newTestDBServer(t)
+
+	// Seed with webhooks_enabled = true.
+	fakeStore.seed("github_app", json.RawMessage(`{"app_id":42,"webhooks_enabled":true}`))
+	_, _ = ops.Refresh(context.Background())
+	if !ops.Snapshot().GitHubWebhooksEnabled {
+		t.Fatal("precondition: GitHubWebhooksEnabled should be true")
+	}
+
+	// Set webhooks_enabled to false.
+	body := `{
+		"server": {
+			"github_app": {"app_id": 42, "webhooks_enabled": false}
+		}
+	}`
+	req := adminRequest(http.MethodPut, "/api/v1/admin/server-config", body)
+	rr := httptest.NewRecorder()
+	srv.handlePutServerConfigDB(rr, req, ops)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("PUT: expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	// Verify the section doc stores *false (not omitted).
+	fakeStore.mu.Lock()
+	row := fakeStore.settings["github_app"]
+	fakeStore.mu.Unlock()
+
+	var ga opsettings.GitHubAppSettings
+	if err := json.Unmarshal(row.Value, &ga); err != nil {
+		t.Fatalf("json.Unmarshal: %v", err)
+	}
+	if ga.WebhooksEnabled == nil {
+		t.Fatal("#391: WebhooksEnabled should be *false in section doc, not nil (omitted)")
+	}
+	if *ga.WebhooksEnabled {
+		t.Error("#391: WebhooksEnabled should be false in section doc")
+	}
+
+	// Verify snapshot reads back false.
+	snap := ops.Snapshot()
+	if snap.GitHubWebhooksEnabled {
+		t.Error("#391: GitHubWebhooksEnabled should be false after saving false")
+	}
+}
+
+// ---- DELETE /api/v1/admin/server-config/sections/{name} (reset) ----
+
+func TestResetSection_DeletesManagedSection(t *testing.T) {
+	srv, fakeStore, ops := newTestDBServer(t)
+
+	// Seed a managed section.
+	fakeStore.seedWithOrigin("access", json.RawMessage(`{"admin_emails":["admin@db.com"],"user_access_mode":"open"}`), "managed")
+	_, _ = ops.Refresh(context.Background())
+
+	rr := httptest.NewRecorder()
+	srv.handleAdminServerConfigSectionReset(rr, adminRequest(http.MethodDelete, "/api/v1/admin/server-config/sections/access", ""))
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	// Row should be deleted.
+	fakeStore.mu.Lock()
+	_, exists := fakeStore.settings["access"]
+	fakeStore.mu.Unlock()
+	if exists {
+		t.Error("expected access row to be deleted after reset")
+	}
+}
+
+func TestResetSection_RejectsNonDelete(t *testing.T) {
+	srv, _, _ := newTestDBServer(t)
+
+	rr := httptest.NewRecorder()
+	srv.handleAdminServerConfigSectionReset(rr, adminRequest(http.MethodGet, "/api/v1/admin/server-config/sections/access", ""))
+
+	if rr.Code != http.StatusMethodNotAllowed {
+		t.Errorf("expected 405, got %d", rr.Code)
+	}
+}
+
+func TestResetSection_RejectsUnknownSection(t *testing.T) {
+	srv, _, _ := newTestDBServer(t)
+
+	rr := httptest.NewRecorder()
+	srv.handleAdminServerConfigSectionReset(rr, adminRequest(http.MethodDelete, "/api/v1/admin/server-config/sections/nonexistent", ""))
+
+	if rr.Code != http.StatusNotFound {
+		t.Errorf("expected 404, got %d", rr.Code)
+	}
+}
+
+func TestResetSection_RequiresAdmin(t *testing.T) {
+	srv, _, _ := newTestDBServer(t)
+
+	// Non-admin request.
+	r := httptest.NewRequest(http.MethodDelete, "/api/v1/admin/server-config/sections/access", nil)
+	viewer := NewAuthenticatedUser("u2", "viewer@example.com", "Viewer", "viewer", "cli")
+	r = r.WithContext(contextWithIdentity(r.Context(), viewer))
+
+	rr := httptest.NewRecorder()
+	srv.handleAdminServerConfigSectionReset(rr, r)
+
+	if rr.Code != http.StatusForbidden {
+		t.Errorf("expected 403, got %d", rr.Code)
 	}
 }

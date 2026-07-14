@@ -729,6 +729,57 @@ func parseCommaSeparatedList(s string) []string {
 	return result
 }
 
+// snakeCaseFields maps flat-lowercased env segments to their snake_case
+// equivalents used by the opsettings registry and settings.yaml. This is
+// the counterpart to camelCaseFields: where camelCaseFields produces keys for
+// Go struct unmarshaling (adminEmails), snakeCaseFields produces keys that
+// match the opsettings keyspace (admin_emails).
+var snakeCaseFields = map[string]string{
+	// Layer-1 compound segments (from opsettings registry)
+	"adminemails":           "admin_emails",
+	"apibaseurl":            "api_base_url",
+	"appid":                 "app_id",
+	"authorizeddomains":     "authorized_domains",
+	"autosuspendstalled":    "auto_suspend_stalled",
+	"cafile":                "ca_file",
+	"defaultharnessconfig":  "default_harness_config",
+	"defaultmaxduration":    "default_max_duration",
+	"defaultmaxmodelcalls":  "default_max_model_calls",
+	"defaultmaxturns":       "default_max_turns",
+	"defaultresources":      "default_resources",
+	"defaulttemplate":       "default_template",
+	"githubapp":             "github_app",
+	"hubname":               "hub_name",
+	"imageregistry":         "image_registry",
+	"insecureskipverify":    "insecure_skip_verify",
+	"installationurl":       "installation_url",
+	"maxsize":               "max_size",
+	"notificationchannels":  "notification_channels",
+	"privatekeypath":        "private_key_path",
+	"publicurl":             "public_url",
+	"reportinterval":        "report_interval",
+	"respectdebugmode":      "respect_debug_mode",
+	"softdeleteretainfiles": "soft_delete_retain_files",
+	"softdeleteretention":   "soft_delete_retention",
+	"useraccessmode":        "user_access_mode",
+	"webhooksenabled":       "webhooks_enabled",
+	// Layer-0 compound segments (from layer0Prefixes)
+	"adminmode":        "admin_mode",
+	"devmode":          "dev_mode",
+	"devtoken":         "dev_token",
+	"devtokenfile":     "dev_token_file",
+	"gcpprojectid":     "gcp_project_id",
+	"hubid":            "hub_id",
+	"logformat":        "log_format",
+	"loglevel":         "log_level",
+	"messagebroker":    "message_broker",
+	"readtimeout":      "read_timeout",
+	"workspacestorage": "workspace_storage",
+	"writetimeout":     "write_timeout",
+	// Maintenance (runtime-only, no yaml, but env detection still needs it)
+	"maintenancemessage": "maintenance_message",
+}
+
 // camelCaseFields maps lowercased environment variable key segments to their
 // camelCase config equivalents. Package-level to avoid re-allocation per call.
 var camelCaseFields = map[string]string{
@@ -797,6 +848,50 @@ func envKeyToConfigKey(envKey string) string {
 	return strings.Join(parts, ".")
 }
 
+// envKeyToOpsettingsKey converts an env var key (after prefix stripping) to a
+// koanf key using snake_case segments that match the opsettings registry and
+// settings.yaml. This is the snake_case counterpart to envKeyToConfigKey.
+// Example: SERVER_HUB_ADMINEMAILS → server.hub.admin_emails
+func envKeyToOpsettingsKey(envKey string) string {
+	parts := strings.Split(strings.ToLower(envKey), "_")
+	for i, part := range parts {
+		if replacement, ok := snakeCaseFields[part]; ok {
+			parts[i] = replacement
+		}
+	}
+	return strings.Join(parts, ".")
+}
+
+// serverSubKeys is the set of first-segment koanf keys (after snake_case
+// mapping) that belong under the "server." namespace in settings.yaml.
+// Derived from the V1ServerConfig koanf tags.
+var serverSubKeys = map[string]bool{
+	"hub": true, "broker": true, "database": true,
+	"auth": true, "oauth": true, "storage": true,
+	"workspace_storage": true, "secrets": true,
+	"log_level": true, "log_format": true,
+	"notification_channels": true, "message_broker": true,
+	"plugins": true, "github_app": true,
+	"mode": true, "env": true,
+}
+
+// serverEnvToOpsettingsKey maps a SCION_SERVER_* env var key (after prefix
+// stripping) to the opsettings koanf keyspace. For keys whose first segment
+// belongs to V1ServerConfig (e.g. hub, auth, database), it prepends "server."
+// so that SCION_SERVER_HUB_ADMINEMAILS → server.hub.admin_emails.
+// Non-server keys (e.g. telemetry, default_template) pass through unchanged.
+func serverEnvToOpsettingsKey(envKey string) string {
+	key := envKeyToOpsettingsKey(envKey)
+	firstSeg := key
+	if dot := strings.Index(key, "."); dot >= 0 {
+		firstSeg = key[:dot]
+	}
+	if serverSubKeys[firstSeg] {
+		return "server." + key
+	}
+	return key
+}
+
 // LoadFileOnlyKoanf returns a koanf instance loaded from settings.yaml +
 // embedded defaults, without any environment variable overlay. This produces
 // the "file fallback" Layer for OperationalSettings (settings-db §3.4/§3.9):
@@ -826,16 +921,130 @@ func LoadFileOnlyKoanf() *koanf.Koanf {
 }
 
 // LoadEnvKoanf returns a koanf instance loaded with only the SCION_SERVER_*
-// environment variables (no file, no defaults). This is used by the
-// OperationalSettings service to detect which Layer-1 keys are overridden by
-// env vars on this node (settings-db §3.4).
+// environment variables (no file, no defaults). Keys are mapped to the
+// opsettings registry keyspace (snake_case with server.* prefix where
+// appropriate) so that DetectEnvOverrides and DetectDeprecatedServerEnv can
+// match them against the registry.
 func LoadEnvKoanf() *koanf.Koanf {
 	k := koanf.New(".")
 	_ = k.Load(env.Provider("SCION_SERVER_", ".", func(s string) string {
 		key := strings.TrimPrefix(s, "SCION_SERVER_")
-		return envKeyToConfigKey(key)
+		return serverEnvToOpsettingsKey(key)
 	}), nil)
 	return k
+}
+
+// LoadSeedEnvKoanf returns a koanf instance loaded with only the SCION_SEED_*
+// environment variables (no file, no defaults). Uses envKeyToOpsettingsKey to
+// produce snake_case keys matching the opsettings registry and settings.yaml.
+// e.g. SCION_SEED_SERVER_HUB_ADMINEMAILS → server.hub.admin_emails
+func LoadSeedEnvKoanf() *koanf.Koanf {
+	k := koanf.New(".")
+	_ = k.Load(env.Provider("SCION_SEED_", ".", func(s string) string {
+		key := strings.TrimPrefix(s, "SCION_SEED_")
+		return envKeyToOpsettingsKey(key)
+	}), nil)
+	return k
+}
+
+// LoadBootstrapKoanf computes the full bootstrap merge:
+//
+//	coded defaults → SCION_SEED_* → settings.yaml → SCION_SERVER_*
+//
+// This produces the canonical "bootstrap material" used for seeding and
+// fallback. Each layer merges on top of the previous one, so SCION_SERVER_*
+// wins over yaml, yaml wins over SCION_SEED_*, and SCION_SEED_* wins over
+// coded defaults.
+//
+// All layers use snake_case keys matching the opsettings registry
+// (e.g. server.hub.admin_emails, not hub.adminEmails). This ensures
+// ExtractSectionFromKoanf can find values from any layer.
+func LoadBootstrapKoanf() *koanf.Koanf {
+	k := koanf.New(".")
+
+	// 1. Coded defaults in the opsettings keyspace (server.* snake_case).
+	// NOTE: This is a manually maintained subset of GlobalConfig defaults.
+	// If new defaulted keys are added to GlobalConfig (or its nested structs),
+	// they must be added here too, otherwise bootstrap material will be
+	// incomplete for sections that rely on them during initial seeding.
+	defaults := DefaultGlobalConfig()
+	_ = k.Load(confmap.Provider(map[string]interface{}{
+		"server.hub.port":         defaults.Hub.Port,
+		"server.hub.host":         defaults.Hub.Host,
+		"server.hub.admin_emails": defaults.Hub.AdminEmails,
+		"server.database.driver":  defaults.Database.Driver,
+		"server.database.url":     defaults.Database.URL,
+		"server.auth.dev_mode":    defaults.Auth.Enabled,
+		"server.auth.dev_token":   defaults.Auth.Token,
+		"server.storage.provider": defaults.Storage.Provider,
+		"server.secrets.backend":  defaults.Secrets.Backend,
+		"server.log_level":        defaults.LogLevel,
+		"server.log_format":       defaults.LogFormat,
+	}, "."), nil)
+
+	// 2. SCION_SEED_* environment variables (snake_case via envKeyToOpsettingsKey).
+	seedK := LoadSeedEnvKoanf()
+	_ = k.Merge(seedK)
+
+	// 3. settings.yaml (+ legacy server.yaml).
+	globalDir, err := GetGlobalDir()
+	if err != nil {
+		slog.Warn("LoadBootstrapKoanf: failed to resolve global settings directory", "error", err)
+	}
+	if globalDir != "" {
+		if err := loadSettingsFile(k, globalDir); err != nil {
+			slog.Warn("LoadBootstrapKoanf: failed to load settings file", "dir", globalDir, "error", err)
+		}
+		loadServerConfigFile(k, globalDir)
+	}
+
+	// 4. SCION_SERVER_* environment variables (highest precedence in bootstrap).
+	// Uses serverEnvToOpsettingsKey which re-adds the "server." prefix for keys
+	// that belong under V1ServerConfig (e.g. HUB_ADMINEMAILS → server.hub.admin_emails).
+	_ = k.Load(env.Provider("SCION_SERVER_", ".", func(s string) string {
+		key := strings.TrimPrefix(s, "SCION_SERVER_")
+		return serverEnvToOpsettingsKey(key)
+	}), nil)
+
+	// 5. Split comma-separated list values from env vars. Koanf's env provider
+	// loads everything as strings; list fields need explicit splitting so
+	// ExtractSectionFromKoanf produces JSON arrays, not bare strings.
+	splitCommaSeparatedKoanfKeys(k)
+
+	return k
+}
+
+// commaSplitKoanfKeys lists koanf paths that represent list values and may
+// arrive as comma-separated strings from environment variables.
+var commaSplitKoanfKeys = []string{
+	"server.hub.admin_emails",
+	"server.auth.authorized_domains",
+}
+
+// splitCommaSeparatedKoanfKeys splits comma-separated string values into slices
+// for known list keys. Koanf's env provider loads all values as strings, but
+// list fields must be slices for correct JSON serialization by ExtractSectionFromKoanf.
+func splitCommaSeparatedKoanfKeys(k *koanf.Koanf) {
+	for _, key := range commaSplitKoanfKeys {
+		if !k.Exists(key) {
+			continue
+		}
+		val := k.Get(key)
+		s, ok := val.(string)
+		if !ok {
+			continue
+		}
+		if strings.Contains(s, ",") {
+			parts := parseCommaSeparatedList(s)
+			sliceVal := make([]interface{}, len(parts))
+			for i, p := range parts {
+				sliceVal[i] = p
+			}
+			_ = k.Load(confmap.Provider(map[string]interface{}{key: sliceVal}, "."), nil)
+		} else {
+			_ = k.Load(confmap.Provider(map[string]interface{}{key: []interface{}{s}}, "."), nil)
+		}
+	}
 }
 
 // applyEnvOverrides loads SCION_SERVER_ environment variables and merges them

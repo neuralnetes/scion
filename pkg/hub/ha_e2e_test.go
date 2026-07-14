@@ -304,7 +304,7 @@ func seedForTest(ctx context.Context, s store.HubSettingStore, fileK *koanf.Koan
 		if err != nil {
 			continue
 		}
-		if _, err := s.UpsertHubSetting(ctx, sec.Name, doc, "seed", -1); err != nil {
+		if _, err := s.UpsertHubSetting(ctx, sec.Name, doc, "seed", -1, "seeded"); err != nil {
 			return err
 		}
 	}
@@ -314,7 +314,7 @@ func seedForTest(ctx context.Context, s store.HubSettingStore, fileK *koanf.Koan
 		"seeded_at":    time.Now().UTC().Format(time.RFC3339),
 		"seed_version": "1",
 	})
-	_, err = s.UpsertHubSetting(ctx, "_meta", metaDoc, "seed", -1)
+	_, err = s.UpsertHubSetting(ctx, "_meta", metaDoc, "seed", -1, "seeded")
 	return err
 }
 
@@ -429,7 +429,7 @@ func TestHA_AC3_MaintenanceSurvivesRestart(t *testing.T) {
 	assert.Equal(t, "AC3 maintenance", srvA2.maintenance.Message())
 }
 
-// ----- AC5: Env override on one hub for Layer-1 key -----
+// ----- AC5: DB wins over env, superseded keys reported -----
 
 func TestHA_AC5_EnvOverrideOneHub(t *testing.T) {
 	requirePG(t)
@@ -442,26 +442,31 @@ func TestHA_AC5_EnvOverrideOneHub(t *testing.T) {
 	defer client.Close()
 	cs := entadapter.NewCompositeStore(client)
 
-	// Seed access section in DB.
+	// Write access section as "managed" (admin-written) with DB value.
 	_, err = cs.UpsertHubSetting(ctx, "access",
 		json.RawMessage(`{"admin_emails":["db@test.com"],"user_access_mode":"open"}`),
-		"seed", -1)
+		"admin", -1, "managed")
 	require.NoError(t, err)
 
-	// Hub A: with env override on admin_emails.
+	// Hub A: env override on admin_emails + bootstrap koanf reflecting the env.
 	envKA := koanf.New(".")
 	require.NoError(t, envKA.Load(confmap.Provider(map[string]interface{}{
 		"server.hub.admin_emails": []interface{}{"env@test.com"},
 	}, "."), nil))
 
-	opsA := NewOperationalSettings(cs, koanf.New("."), envKA)
+	bootstrapA := koanf.New(".")
+	require.NoError(t, bootstrapA.Load(confmap.Provider(map[string]interface{}{
+		"server.hub.admin_emails": []interface{}{"env@test.com"},
+	}, "."), nil))
+
+	opsA := NewOperationalSettings(cs, bootstrapA, envKA)
 	_, err = opsA.Refresh(ctx)
 	require.NoError(t, err)
 
 	srvA := &Server{dbDriver: "postgres", maintenance: NewMaintenanceState(false, "")}
 	srvA.SetOperationalSettings(opsA)
 
-	// Hub B: no env override.
+	// Hub B: no env override, empty bootstrap.
 	opsB := NewOperationalSettings(cs, koanf.New("."), koanf.New("."))
 	_, err = opsB.Refresh(ctx)
 	require.NoError(t, err)
@@ -469,7 +474,7 @@ func TestHA_AC5_EnvOverrideOneHub(t *testing.T) {
 	srvB := &Server{dbDriver: "postgres", maintenance: NewMaintenanceState(false, "")}
 	srvB.SetOperationalSettings(opsB)
 
-	// GET on A should report env_overrides and serve env value.
+	// GET on A: DB value wins, env_overrides listed, superseded_keys reported.
 	rrA := httptest.NewRecorder()
 	srvA.handleGetServerConfigDB(rrA, adminReq(http.MethodGet, "/api/v1/admin/server-config", ""), opsA)
 	require.Equal(t, http.StatusOK, rrA.Code)
@@ -477,14 +482,26 @@ func TestHA_AC5_EnvOverrideOneHub(t *testing.T) {
 	var respA ServerConfigDBResponse
 	require.NoError(t, json.Unmarshal(rrA.Body.Bytes(), &respA))
 
-	assert.Contains(t, respA.EnvOverrides, "server.hub.admin_emails",
-		"AC5: A should report admin_emails in env_overrides")
 	require.NotNil(t, respA.Server)
 	require.NotNil(t, respA.Server.Hub)
-	assert.Equal(t, []string{"env@test.com"}, respA.Server.Hub.AdminEmails,
-		"AC5: A should serve env value for admin_emails")
+	assert.Equal(t, []string{"db@test.com"}, respA.Server.Hub.AdminEmails,
+		"AC5: DB value must win over env on hub A")
+	assert.Contains(t, respA.EnvOverrides, "server.hub.admin_emails",
+		"AC5: A should still list env key in env_overrides")
 
-	// GET on B should NOT report env_overrides and serve DB value.
+	require.Contains(t, respA.SupersededKeys, "access",
+		"AC5: managed access section should have superseded keys on A")
+	var foundAdmin bool
+	for _, sk := range respA.SupersededKeys["access"] {
+		if sk.Key == "admin_emails" {
+			foundAdmin = true
+			assert.Equal(t, "server_env", sk.Source,
+				"AC5: superseded admin_emails source should be server_env")
+		}
+	}
+	assert.True(t, foundAdmin, "AC5: admin_emails must appear in superseded_keys for access")
+
+	// GET on B: same DB value, no env_overrides, no superseded keys.
 	rrB := httptest.NewRecorder()
 	srvB.handleGetServerConfigDB(rrB, adminReq(http.MethodGet, "/api/v1/admin/server-config", ""), opsB)
 	require.Equal(t, http.StatusOK, rrB.Code)
@@ -492,11 +509,12 @@ func TestHA_AC5_EnvOverrideOneHub(t *testing.T) {
 	var respB ServerConfigDBResponse
 	require.NoError(t, json.Unmarshal(rrB.Body.Bytes(), &respB))
 
-	assert.Empty(t, respB.EnvOverrides, "AC5: B should have no env_overrides")
 	require.NotNil(t, respB.Server)
 	require.NotNil(t, respB.Server.Hub)
 	assert.Equal(t, []string{"db@test.com"}, respB.Server.Hub.AdminEmails,
 		"AC5: B should serve DB value for admin_emails")
+	assert.Empty(t, respB.EnvOverrides, "AC5: B should have no env_overrides")
+	assert.Empty(t, respB.SupersededKeys, "AC5: B should have no superseded_keys")
 }
 
 // ----- AC7: Concurrent PUTs with CAS -----
@@ -508,7 +526,7 @@ func TestHA_AC7_ConcurrentCAS(t *testing.T) {
 	// Seed access section.
 	_, err := env.storeA.UpsertHubSetting(ctx, "access",
 		json.RawMessage(`{"admin_emails":["orig@test.com"],"user_access_mode":"open"}`),
-		"seed", -1)
+		"seed", -1, "seeded")
 	require.NoError(t, err)
 	_, err = env.opsA.Refresh(ctx)
 	require.NoError(t, err)
@@ -684,11 +702,11 @@ func TestHA_AC10_RollbackSafety(t *testing.T) {
 
 	_, err = cs.UpsertHubSetting(ctx, "access",
 		json.RawMessage(`{"admin_emails":["db@test.com"],"user_access_mode":"invite_only"}`),
-		"admin", -1)
+		"admin", -1, "managed")
 	require.NoError(t, err)
 	_, err = cs.UpsertHubSetting(ctx, "maintenance",
 		json.RawMessage(`{"admin_mode":true,"maintenance_message":"DB maintenance"}`),
-		"admin", -1)
+		"admin", -1, "managed")
 	require.NoError(t, err)
 	_ = client.Close()
 

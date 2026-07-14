@@ -1330,10 +1330,16 @@ type HubSettingStore interface {
 	//   expectedRevision == 0:  create-only; returns ErrRevisionConflict if the section already exists.
 	//   expectedRevision == -1: unconditional upsert (used for seeding); always succeeds.
 	//   expectedRevision > 0:   CAS update; returns ErrRevisionConflict if current revision != expectedRevision.
+	// origin must be "seeded" or "managed" — seed-writes pass "seeded", admin-PUT writes pass "managed".
 	UpsertHubSetting(ctx context.Context, section string, value json.RawMessage,
-		updatedBy string, expectedRevision int64) (*HubSetting, error)
+		updatedBy string, expectedRevision int64, origin string) (*HubSetting, error)
 
 	// DeleteHubSetting removes a hub setting by section name.
 	// Returns ErrNotFound if the section doesn't exist.
 	DeleteHubSetting(ctx context.Context, section string) error
+
+	// BackfillOrigin sets the origin column for existing rows that predate
+	// the origin field. Rows with updated_by="seed" get origin="seeded";
+	// all other non-_meta rows get origin="managed". Idempotent.
+	BackfillOrigin(ctx context.Context) error
 }

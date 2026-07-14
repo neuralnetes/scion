@@ -20,7 +20,6 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand"
-	"os"
 	"sync"
 	"time"
 
@@ -41,6 +40,7 @@ type sectionState struct {
 	Revision  int64
 	UpdatedAt time.Time
 	UpdatedBy string
+	Origin    string
 }
 
 // Layer1Snapshot is an immutable merged view of all Layer-1 operational settings.
@@ -50,7 +50,7 @@ type sectionState struct {
 //
 // Field population depends on the source:
 //   - Postgres mode (OperationalSettings.Snapshot): ALL fields are populated via
-//     the full koanf merge (env > DB > file > defaults). This includes
+//     the koanf merge (DB > bootstrap merge). This includes
 //     SoftDeleteRetention, SoftDeleteRetainFiles, PublicURL, ImageRegistry,
 //     DefaultTemplate, DefaultHarnessConfig, DefaultMaxTurns, DefaultMaxModelCalls,
 //     DefaultMaxDuration, DefaultResources, and NotificationChannels.
@@ -129,12 +129,12 @@ type SettingsUpdatedEvent struct {
 // It is owned by the Server and used only when database.driver == "postgres".
 // In file/SQLite mode the legacy reloadSettings path is used instead.
 type OperationalSettings struct {
-	store        store.HubSettingStore
-	fileFallback *koanf.Koanf    // Layer-1 keys from settings.yaml + defaults (file values only, never env)
-	envOverrides map[string]bool // Layer-1 koanf keys satisfied by env
-	envKoanf     *koanf.Koanf    // env-only koanf for merge
-	mu           sync.RWMutex
-	cache        map[string]sectionState // section name → cached value + revision
+	store          store.HubSettingStore
+	bootstrapKoanf *koanf.Koanf    // Full bootstrap merge: defaults → SEED → yaml → SERVER
+	envOverrides   map[string]bool // Layer-1 koanf keys satisfied by env
+	envKoanf       *koanf.Koanf    // env-only koanf for merge
+	mu             sync.RWMutex
+	cache          map[string]sectionState // section name → cached value + revision
 
 	// Event publisher for cross-replica propagation (nil in SQLite/file mode).
 	events EventPublisher
@@ -154,13 +154,12 @@ type OperationalSettings struct {
 
 // NewOperationalSettings creates a new OperationalSettings service.
 //
-// fileFallback is a koanf instance loaded from settings.yaml (file values only,
-// no env overlay) representing the Layer-1 fallback when a section is absent
-// from the DB. envKoanf is a koanf instance containing only SCION_SERVER_*
-// environment variable keys for the precedence merge.
+// bootstrapKoanf is the full bootstrap merge (defaults → SEED → yaml → SERVER)
+// used as the fallback for sections absent from the DB. envKoanf is retained
+// only for env-override detection; it is NOT merged into Snapshot.
 func NewOperationalSettings(
 	st store.HubSettingStore,
-	fileFallback *koanf.Koanf,
+	bootstrapKoanf *koanf.Koanf,
 	envKoanf *koanf.Koanf,
 ) *OperationalSettings {
 	envOverrides := make(map[string]bool)
@@ -169,11 +168,11 @@ func NewOperationalSettings(
 	}
 
 	return &OperationalSettings{
-		store:        st,
-		fileFallback: fileFallback,
-		envOverrides: envOverrides,
-		envKoanf:     envKoanf,
-		cache:        make(map[string]sectionState),
+		store:          st,
+		bootstrapKoanf: bootstrapKoanf,
+		envOverrides:   envOverrides,
+		envKoanf:       envKoanf,
+		cache:          make(map[string]sectionState),
 	}
 }
 
@@ -206,6 +205,7 @@ func (o *OperationalSettings) Refresh(ctx context.Context) ([]string, error) {
 			Revision:  row.Revision,
 			UpdatedAt: row.UpdatedAt,
 			UpdatedBy: row.UpdatedBy,
+			Origin:    row.Origin,
 		}
 	}
 
@@ -222,13 +222,13 @@ func (o *OperationalSettings) Refresh(ctx context.Context) ([]string, error) {
 
 // Snapshot returns an immutable merged Layer-1 view.
 //
-// Precedence (per §3.4):
+// Precedence (per design §3.1):
 //
-//	env > DB > file > defaults
+//	DB rows > bootstrap merge (defaults → SEED → yaml → SERVER)
 //
-// Absent-vs-empty: a DB row present for a section fully owns that section
-// (its omitted fields fall to compiled defaults, not to the file). A deleted
-// row restores file fallback for that section.
+// DB sections fully own their keys; absent sections fall back to the bootstrap
+// merge. Env vars are NOT merged on top — they feed the bootstrap layer and
+// are honored as seed input during the deprecation window.
 func (o *OperationalSettings) Snapshot() Layer1Snapshot {
 	o.mu.RLock()
 	dbSections := make(map[string]json.RawMessage, len(o.cache))
@@ -237,39 +237,34 @@ func (o *OperationalSettings) Snapshot() Layer1Snapshot {
 	}
 	o.mu.RUnlock()
 
-	// Build the merged koanf: start with file fallback, overlay DB sections,
-	// then overlay env.
+	// Build the merged koanf: bootstrap fallback, overlaid by DB sections.
 	merged := koanf.New(".")
 
-	// Layer: file fallback (lowest precedence for Layer-1 keys).
+	// Layer: bootstrap merge (lowest precedence for Layer-1 keys).
 	// Only load keys for sections NOT present in DB.
 	for _, sec := range opsettings.Registry {
 		if _, inDB := dbSections[sec.Name]; inDB {
-			continue // DB fully owns this section
+			// DB rows must contain complete section documents. The Update
+			// path builds a full document from the PUT payload, so partial
+			// rows should not occur in normal operation. If a partial row
+			// is created externally, missing keys will have zero values
+			// rather than bootstrap defaults.
+			continue
 		}
 		if len(sec.KoanfPaths) == 0 {
 			continue
 		}
 		// Extract this section from the file fallback and load it.
-		doc, err := opsettings.ExtractSectionFromKoanf(o.fileFallback, sec.Name)
+		doc, err := opsettings.ExtractSectionFromKoanf(o.bootstrapKoanf, sec.Name)
 		if err != nil {
 			continue
 		}
 		_ = loadSectionDocIntoKoanf(merged, sec.Name, doc)
 	}
 
-	// Layer: DB sections.
+	// Layer: DB sections (highest precedence — DB wins over bootstrap).
 	for name, doc := range dbSections {
 		_ = loadSectionDocIntoKoanf(merged, name, doc)
-	}
-
-	// Layer: env overrides (highest precedence).
-	if o.envKoanf != nil {
-		for _, key := range o.envKoanf.Keys() {
-			if opsettings.IsLayer1Key(key) {
-				_ = merged.Set(key, o.envKoanf.Get(key))
-			}
-		}
 	}
 
 	snap := buildSnapshotFromKoanf(merged)
@@ -313,13 +308,14 @@ func (o *OperationalSettings) Update(
 	doc json.RawMessage,
 	updatedBy string,
 	expectedRevision int64,
+	origin string,
 ) (int64, error) {
 	// Validate via opsettings registry.
 	if errs := opsettings.Validate(section, doc); len(errs) > 0 {
 		return 0, fmt.Errorf("validation failed for section %q: %v", section, errs)
 	}
 
-	result, err := o.store.UpsertHubSetting(ctx, section, doc, updatedBy, expectedRevision)
+	result, err := o.store.UpsertHubSetting(ctx, section, doc, updatedBy, expectedRevision, origin)
 	if err != nil {
 		return 0, err
 	}
@@ -331,6 +327,7 @@ func (o *OperationalSettings) Update(
 		Revision:  result.Revision,
 		UpdatedAt: result.UpdatedAt,
 		UpdatedBy: result.UpdatedBy,
+		Origin:    result.Origin,
 	}
 	o.mu.Unlock()
 
@@ -355,6 +352,34 @@ func (o *OperationalSettings) Update(
 	}
 
 	return result.Revision, nil
+}
+
+// DeleteSection removes a section row from the store, evicts it from the local
+// cache, publishes an event so peers refresh, and self-applies. The section
+// falls back to bootstrap material immediately (design §3.2.4).
+func (o *OperationalSettings) DeleteSection(ctx context.Context, section string) error {
+	if err := o.store.DeleteHubSetting(ctx, section); err != nil {
+		return err
+	}
+
+	o.mu.Lock()
+	delete(o.cache, section)
+	o.mu.Unlock()
+
+	if o.events != nil {
+		o.events.PublishRaw(settingsUpdatedSubject, SettingsUpdatedEvent{
+			Section:  section,
+			Revision: 0,
+		})
+	}
+
+	if o.server != nil {
+		snap := o.Snapshot()
+		ApplySnapshot(o.server, snap)
+		ApplyMaintenanceFromSnapshot(o.server, snap)
+	}
+
+	return nil
 }
 
 // EnvOverriddenKeys returns the list of Layer-1 koanf keys that are overridden
@@ -739,33 +764,15 @@ func ApplySnapshot(s *Server, snap Layer1Snapshot) map[string]interface{} {
 //   - If snap.HasMaintenanceRow is true: apply DB values, UNLESS the
 //     SCION_SERVER_ADMIN_MODE env var is set (per-node break-glass override).
 //
-// Phase 4 will call this on propagation events — a changed maintenance row
-// propagated from another node MUST apply, but env force-enable still wins
-// on this node.
+// ApplyMaintenanceFromSnapshot applies the maintenance settings from the
+// snapshot to the server's maintenance state. In HA mode, maintenance must
+// be cluster-consistent — per-node env force-win is removed.
 func ApplyMaintenanceFromSnapshot(s *Server, snap Layer1Snapshot) {
 	if !snap.HasMaintenanceRow {
-		// No maintenance row in DB — leave MaintenanceState as initialized
-		// at startup (which already honors the env var).
 		return
 	}
 
-	adminMode := snap.AdminMode
-	message := snap.MaintenanceMessage
-
-	// SCION_SERVER_ADMIN_MODE env var overrides bidirectionally: it can
-	// force-enable OR force-disable admin mode on this node, matching the
-	// pre-existing startup semantics in cmd/server_foreground.go:80-82.
-	// The design doc says "force-enables" but we keep parity with existing
-	// behavior (which parses the value as a boolean). The docs phase will
-	// document the bidirectional override.
-	if v := os.Getenv("SCION_SERVER_ADMIN_MODE"); v != "" {
-		adminMode = v == "true" || v == "1" || v == "yes"
-	}
-	if v := os.Getenv("SCION_SERVER_MAINTENANCE_MESSAGE"); v != "" {
-		message = v
-	}
-
-	s.maintenance.Set(adminMode, message)
+	s.maintenance.Set(snap.AdminMode, snap.MaintenanceMessage)
 }
 
 // applySnapshotLogLevel applies the log-level portion of the snapshot.
