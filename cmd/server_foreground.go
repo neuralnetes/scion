@@ -670,6 +670,17 @@ func loadAndReconcileConfig(cmd *cobra.Command) (*config.GlobalConfig, error) {
 			cfg.Storage.Provider = "local"
 		}
 		cfg.Secrets.Backend = "local"
+
+		// Auto-detect gcloud ADC credentials for GCP clients.
+		if os.Getenv("GOOGLE_APPLICATION_CREDENTIALS") == "" {
+			if home, err := os.UserHomeDir(); err == nil {
+				adcPath := filepath.Join(home, ".config", "gcloud", "application_default_credentials.json")
+				if _, err := os.Stat(adcPath); err == nil {
+					os.Setenv("GOOGLE_APPLICATION_CREDENTIALS", adcPath)
+					log.Printf("GCP: auto-detected gcloud ADC credentials at %s", adcPath)
+				}
+			}
+		}
 	}
 
 	// Override with command-line flags
