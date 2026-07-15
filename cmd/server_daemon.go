@@ -597,6 +597,19 @@ func printWorkstationQuickstart(needsOnboarding bool, globalDir string, host str
 			displayHost = "127.0.0.1"
 		}
 
+		// Auto-configure hub.endpoint so that `scion hub` commands work
+		// immediately after workstation-mode start.
+		hubEndpoint := fmt.Sprintf("http://%s:%d", displayHost, wPort)
+		if vs, err := config.LoadSingleFileVersioned(globalDir); err == nil {
+			if vs.GetHubEndpoint() == "" {
+				if err := config.UpdateVersionedSetting(globalDir, "hub.endpoint", hubEndpoint); err != nil {
+					fmt.Fprintf(os.Stderr, "Warning: failed to auto-configure hub endpoint: %v\n", err)
+				} else {
+					fmt.Printf("Configured hub endpoint: %s (run 'scion hub status' to verify)\n", hubEndpoint)
+				}
+			}
+		}
+
 		// Point to /onboarding when the machine hadn't been set up before daemon start.
 		// This state is captured before the daemon launches (which auto-creates settings.yaml).
 		path := ""
