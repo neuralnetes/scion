@@ -677,12 +677,18 @@ func (s *Server) handleInstallIntegration(w http.ResponseWriter, r *http.Request
 
 	if err := mgr.InstallPlugin(name, repoPath, pluginsDir, configFilePath); err != nil {
 		slog.Error("Failed to install integration", "plugin", name, "error", err)
-		InternalError(w)
+		// Use a sanitized message — raw error may contain compiler output and host paths.
+		writeError(w, http.StatusInternalServerError, ErrCodeInternalError,
+			"Plugin installation failed — check server logs for details", nil)
 		return
 	}
 
 	if err := s.reconfigureIntegration(r.Context(), mgr, name); err != nil {
-		slog.Warn("Plugin installed but reconfigure failed", "plugin", name, "error", err)
+		// Plugin is already written to disk and registered in settings.yaml.
+		// Returning 500 would leave an inconsistent state (installed on disk,
+		// error reported to client). Treat as a non-fatal warning; the operator
+		// can reconfigure via the admin UI.
+		slog.Warn("Plugin installed but initial reconfigure failed", "plugin", name, "error", err)
 	}
 
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
