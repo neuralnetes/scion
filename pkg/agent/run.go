@@ -38,6 +38,7 @@ import (
 )
 
 var ErrTmuxBinaryNotFound = errors.New("tmux binary not found")
+var ErrContainerNameInUse = errors.New("agent name is already in use by a stopped container; please delete the existing agent or choose a different name")
 
 func classifyLaunchRuntimeError(err error, resolvedImage string) error {
 	if err == nil {
@@ -46,7 +47,19 @@ func classifyLaunchRuntimeError(err error, resolvedImage string) error {
 	if errors.Is(err, exec.ErrNotFound) || isTmuxShellNotFoundError(err) {
 		return fmt.Errorf("failed to launch container in image %q: %w: %w", resolvedImage, ErrTmuxBinaryNotFound, err)
 	}
+	if isContainerNameInUseError(err) {
+		return ErrContainerNameInUse
+	}
 	return fmt.Errorf("failed to launch container: %w", err)
+}
+
+func isContainerNameInUseError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return (strings.Contains(msg, "container name") && strings.Contains(msg, "already in use")) ||
+		strings.Contains(msg, "is already in use by container")
 }
 
 func isTmuxShellNotFoundError(err error) bool {
