@@ -314,6 +314,8 @@ type OnboardingStatus struct {
 	GCPProjectID        string `json:"gcpProjectId,omitempty"`
 	GitVersion          string `json:"gitVersion,omitempty"`
 	GitVersionOK        bool   `json:"gitVersionOK"`
+	GCloudADCAvailable  bool   `json:"gcloudADCAvailable"`
+	AutoInjectGcloudADC bool   `json:"autoInjectGcloudADC"`
 }
 
 func (s *Server) computeOnboardingStatus(ctx context.Context) OnboardingStatus {
@@ -394,6 +396,21 @@ func (s *Server) computeOnboardingStatus(ctx context.Context) OnboardingStatus {
 	} else {
 		status.GitVersion = "not found"
 		status.GitVersionOK = false
+	}
+
+	// GCloudADCAvailable: check if host has gcloud ADC file
+	if home, hErr := os.UserHomeDir(); hErr == nil {
+		adcPath := filepath.Join(home, ".config", "gcloud", "application_default_credentials.json")
+		if _, err := os.Stat(adcPath); err == nil {
+			status.GCloudADCAvailable = true
+		}
+	}
+
+	// AutoInjectGcloudADC: read current setting value
+	if vs, loadErr := config.LoadSingleFileVersioned(globalDir); loadErr == nil && vs != nil {
+		if vs.Server != nil {
+			status.AutoInjectGcloudADC = vs.Server.AutoInjectGcloudADC
+		}
 	}
 
 	return status

@@ -512,6 +512,38 @@ func (s *Server) buildStartContext(ctx context.Context, in startContextInputs) (
 		}
 	}
 
+	// In co-located (workstation) hub mode, auto-inject the host ADC file as a
+	// gcloud-adc file secret so agents can authenticate with GCP without requiring
+	// the user to manually upload the credential file.
+	// Only inject if the user has explicitly opted in via settings.
+	if isColocated {
+		if adcGlobalDir, gErr := config.GetGlobalDir(); gErr == nil {
+			if vs, loadErr := config.LoadSingleFileVersioned(adcGlobalDir); loadErr == nil &&
+				vs != nil && vs.Server != nil && vs.Server.AutoInjectGcloudADC {
+				home, _ := os.UserHomeDir()
+				adcPath := filepath.Join(home, ".config", "gcloud", "application_default_credentials.json")
+				if data, err := os.ReadFile(adcPath); err == nil {
+					alreadyHave := false
+					for _, s := range opts.ResolvedSecrets {
+						if s.Name == "gcloud-adc" {
+							alreadyHave = true
+							break
+						}
+					}
+					if !alreadyHave {
+						opts.ResolvedSecrets = append(opts.ResolvedSecrets, api.ResolvedSecret{
+							Name:   "gcloud-adc",
+							Type:   "file",
+							Target: "/home/scion/.config/gcloud/application_default_credentials.json",
+							Value:  string(data),
+							Source: "runtime_broker",
+						})
+					}
+				}
+			}
+		}
+	}
+
 	// --- Manager resolution ---
 	mgr := s.resolveManagerForOpts(opts)
 
