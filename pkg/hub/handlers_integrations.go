@@ -618,26 +618,35 @@ func (s *Server) handleInstallIntegration(w http.ResponseWriter, r *http.Request
 	}
 
 	repoPath := s.config.MaintenanceConfig.RepoPath
-	if repoPath == "" {
-		slog.Error("No repository path configured for plugin install")
-		InternalError(w)
+	binaryName := "scion-plugin-" + name
+	_, lookPathErr := exec.LookPath(binaryName)
+	binaryOnPath := lookPathErr == nil
+
+	if repoPath == "" && !binaryOnPath {
+		slog.Error("No repository path configured and plugin binary not found on PATH",
+			"plugin", name, "binary", binaryName)
+		writeError(w, http.StatusInternalServerError, ErrCodeInternalError,
+			"Plugin installation requires either a repository path or the plugin binary on PATH", nil)
 		return
 	}
 
-	sourceDir := filepath.Join(repoPath, "extras", "scion-"+name)
-	if _, err := os.Stat(sourceDir); err != nil {
-		NotFound(w, "plugin source")
-		return
-	}
+	// Source-dir check and build lock only apply when building from source.
+	if repoPath != "" {
+		sourceDir := filepath.Join(repoPath, "extras", "scion-"+name)
+		if _, err := os.Stat(sourceDir); err != nil {
+			NotFound(w, "plugin source")
+			return
+		}
 
-	mu := acquirePluginBuildLock(name)
-	if mu == nil {
-		writeJSON(w, http.StatusConflict, map[string]string{
-			"error": "a build is already in progress for this integration",
-		})
-		return
+		mu := acquirePluginBuildLock(name)
+		if mu == nil {
+			writeJSON(w, http.StatusConflict, map[string]string{
+				"error": "a build is already in progress for this integration",
+			})
+			return
+		}
+		defer releasePluginBuildLock(name)
 	}
-	defer releasePluginBuildLock(name)
 
 	pluginsDir, err := plugin.DefaultPluginsDir()
 	if err != nil {
@@ -675,12 +684,19 @@ func (s *Server) handleInstallIntegration(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	if err := mgr.InstallPlugin(name, repoPath, pluginsDir, configFilePath); err != nil {
-		slog.Error("Failed to install integration", "plugin", name, "error", err)
-		// Use a sanitized message — raw error may contain compiler output and host paths.
-		writeError(w, http.StatusInternalServerError, ErrCodeInternalError,
-			"Plugin installation failed — check server logs for details", nil)
-		return
+	if repoPath != "" {
+		// Build from source (dev mode).
+		if err := mgr.InstallPlugin(name, repoPath, pluginsDir, configFilePath); err != nil {
+			slog.Error("Failed to install integration", "plugin", name, "error", err)
+			// Use a sanitized message — raw error may contain compiler output and host paths.
+			writeError(w, http.StatusInternalServerError, ErrCodeInternalError,
+				"Plugin installation failed — check server logs for details", nil)
+			return
+		}
+	} else {
+		// Binary is already on PATH (Homebrew/package-manager install).
+		// Config file and settings.yaml were written above — no build needed.
+		slog.Info("Plugin binary found on PATH, skipping build", "plugin", name, "binary", binaryName)
 	}
 
 	if err := s.reconfigureIntegration(r.Context(), mgr, name); err != nil {
