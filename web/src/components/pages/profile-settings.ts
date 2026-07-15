@@ -43,6 +43,9 @@ export class ScionPageProfileSettings extends LitElement {
   @state()
   private _autoInjectGcloudADC = false;
 
+  @state()
+  private _isWorkstation = false;
+
   static override styles = css`
     :host {
       display: block;
@@ -175,9 +178,11 @@ export class ScionPageProfileSettings extends LitElement {
         const data = (await res.json()) as {
           gcloudADCAvailable?: boolean;
           autoInjectGcloudADC?: boolean;
+          workstation?: boolean;
         };
         this._gcloudADCAvailable = data.gcloudADCAvailable ?? false;
         this._autoInjectGcloudADC = data.autoInjectGcloudADC ?? false;
+        this._isWorkstation = data.workstation ?? false;
       }
     } catch {
       // Non-critical — leave defaults
@@ -229,11 +234,14 @@ export class ScionPageProfileSettings extends LitElement {
     const enabled = target.checked;
     this._autoInjectGcloudADC = enabled;
     try {
-      await apiFetch('/api/v1/system/workstation-settings', {
+      const res = await apiFetch('/api/v1/system/workstation-settings', {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ auto_inject_gcloud_adc: enabled }),
       });
+      if (!res.ok) {
+        throw new Error('Failed to update workstation settings');
+      }
     } catch {
       // Revert on failure
       this._autoInjectGcloudADC = !enabled;
@@ -313,7 +321,7 @@ export class ScionPageProfileSettings extends LitElement {
         ${this._renderPermissionStatus()}
       </div>
 
-      ${this._gcloudADCAvailable ? html`
+      ${this._gcloudADCAvailable && this._isWorkstation ? html`
         <div class="settings-card">
           <h2 class="section-title">
             <sl-icon name="cloud"></sl-icon>

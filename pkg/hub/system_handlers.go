@@ -317,6 +317,7 @@ type OnboardingStatus struct {
 	GitVersionOK        bool   `json:"gitVersionOK"`
 	GCloudADCAvailable  bool   `json:"gcloudADCAvailable"`
 	AutoInjectGcloudADC bool   `json:"autoInjectGcloudADC"`
+	Workstation         bool   `json:"workstation"`
 }
 
 func (s *Server) computeOnboardingStatus(ctx context.Context) OnboardingStatus {
@@ -411,6 +412,9 @@ func (s *Server) computeOnboardingStatus(ctx context.Context) OnboardingStatus {
 	if vs, loadErr := config.LoadSingleFileVersioned(globalDir); loadErr == nil && vs != nil {
 		status.AutoInjectGcloudADC = vs.AutoInjectGcloudADC
 	}
+
+	// Workstation: whether the server is running in workstation mode
+	status.Workstation = s.workstation
 
 	return status
 }
@@ -1099,6 +1103,9 @@ func (s *Server) handleWorkstationSettings(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	globalDir, err := config.GetGlobalDir()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, ErrCodeInternalError, "Failed to resolve settings directory", nil)
@@ -1113,18 +1120,15 @@ func (s *Server) handleWorkstationSettings(w http.ResponseWriter, r *http.Reques
 			writeError(w, http.StatusInternalServerError, ErrCodeInternalError, "Failed to parse settings file", nil)
 			return
 		}
+	} else if !os.IsNotExist(readErr) {
+		writeError(w, http.StatusInternalServerError, ErrCodeInternalError, "Failed to read settings file", nil)
+		return
 	}
 	if raw == nil {
 		raw = make(map[string]interface{})
 	}
 
-	if req.AutoInjectGcloudADC != nil {
-		if *req.AutoInjectGcloudADC {
-			raw["auto_inject_gcloud_adc"] = true
-		} else {
-			delete(raw, "auto_inject_gcloud_adc")
-		}
-	}
+	raw["auto_inject_gcloud_adc"] = *req.AutoInjectGcloudADC
 
 	if _, ok := raw["schema_version"]; !ok {
 		raw["schema_version"] = "1"
