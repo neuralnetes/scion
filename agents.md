@@ -176,6 +176,55 @@ When in doubt, check `.gitignore` before staging. If a new category of generated
 - **Lean forward on "project" over legacy "grove".** The grove→project rename is the product direction and is still ongoing — actively prefer `project` naming in new/edited code, tests, and fixtures (e.g. the settings key `project_id`, not legacy `grove_id`). When a test or fixture still uses a legacy `grove_id` key, updating it to `project_id` is the preferred fix over propping up legacy-key compat. Known gap: the legacy *top-level* `grove_id` *file* key no longer resolves to `project_id` in config loading (only `SCION_GROVE_ID` env and v1 `hub.grove_id` are remapped) — surfaced via two tests that were red on `main` and fixed by moving their fixtures to `project_id`.
 - **Proactively raise adjacent cleanup.** When doing a scoped task, surface other architecture/design improvements, drift risks, and simplifications you notice — with specifics (file/function, payoff, blast radius) so the human can decide. Raise them; don't implement them unprompted. The human treats you as a design collaborator, not just an executor.
 
+## Fork status: neuralnetes/scion vs. upstream GoogleCloudPlatform/scion
+
+This checkout is `neuralnetes/scion`, a fork of `GoogleCloudPlatform/scion`. Two remotes are configured (`git remote -v`):
+
+- `origin` → `https://github.com/neuralnetes/scion.git` — our fork, push target.
+- `upstream` → `https://github.com/GoogleCloudPlatform/scion.git` — pull-only, used only to rebase onto.
+
+### Rebase, not merge
+
+The fork stays current by periodically **rebasing** our small patch set onto `upstream/main`, not by merging upstream in. `git merge-base HEAD upstream/main` currently resolves to `38d04745` (`agent: add --thinking-level flag and SCION_THINKING_LEVEL env injection (#794)`), i.e. everything from upstream up to and including that commit is in our history unmodified.
+
+`origin/main` tip is `1737f0cc`, a merge commit ("`Merge remote-tracking branch 'origin/main' into neuralnetes/rebase-onto-upstream-2026-06-28`") with two parents:
+
+- `a9f4bbf3` — tip of the freshly-rebased branch (`neuralnetes/rebase-onto-upstream-2026-06-28`), carrying just our one feature patch (below) on top of current upstream.
+- `1978699c` — the *old* `origin/main`, which had progressed (via a separate GitHub PR) while the rebase was being prepared, and still carried an earlier version of the same feature plus two patches that were intentionally dropped (see below).
+
+This is the one place in the fork's history where a real merge commit exists instead of a clean rebase — it's a GitHub PR-merge across a branch that had diverged from `main` mid-rebase, not the normal pattern. It was verified to be a safe reconciliation, not a content merge: `git diff 1737f0cc a9f4bbf3` is empty, i.e. the merge commit's tree is byte-identical to the rebased branch tip. The merge commit exists only to satisfy GitHub's PR-merge history requirements; the actual file content it introduced is exactly what the rebase already produced.
+
+Note: the local `main` branch ref (`f3187929`) is stale/behind `origin/main` (`1737f0cc`) as of this writing — diff/compare against `origin/main` or `HEAD`, not local `main`.
+
+### The one feature patch we carry on top of upstream
+
+A generic OAuth2/OIDC provider for the Hub (works with Dex, Ory Hydra, or any standards-compliant OIDC issuer), modeled on Better Auth's `generic-oauth` client plugin. Supports Web (fixed pre-registered redirect URI), CLI (authorization-code flow with a caller-supplied loopback redirect), and Device (RFC 8628 device-authorization grant — requires the issuer to advertise `device_authorization_endpoint` via OIDC discovery; Dex and Ory Hydra both do). Also adds `ClaimMapping` (remap non-standard claim keys) and `OverrideUserInfo` (control whether profile fields refresh or only backfill on login), mirroring Better Auth's `mapProfileToUser` / `overrideUserInfo` options.
+
+Verified file list (`git diff --stat $(git merge-base HEAD upstream/main)..HEAD -- . ':(exclude)go.sum'`), +1738/-45 total:
+
+- `cmd/server_foreground.go`
+- `pkg/config/hub_config.go`
+- `pkg/hub/handlers_auth.go` (+ `handlers_auth_test.go`)
+- `pkg/hub/oauth.go` (+ `oauth_test.go`)
+- `pkg/hub/oauth_generic.go` — new, 532 lines — the provider implementation
+- `pkg/hub/oauth_generic_test.go` — new, 669 lines
+- `pkg/hub/web.go`
+- `pkg/hubclient/auth.go`
+
+Two other fork patches were **deliberately dropped** during the June 2026 rebase because upstream shipped equivalent or better fixes independently — do not re-apply the local branches that still hold them (`neuralnetes/fix-notification-dispatch`, `neuralnetes/fix-broker-control-channel`):
+
+- A notification-dispatcher NATS-wildcard fix (`project.*.agent.*` overmatch). Current upstream code already uses correctly-scoped single-token wildcard subscriptions (e.g. `project.*.agent.status` in `pkg/hub/lifecycle_hook_evaluator.go`).
+- A control-channel blocking-dispatch fix (goroutine-per-request). Current upstream `pkg/runtimebroker/controlchannel.go` already dispatches per request off the read loop.
+
+### Downstream deploy trigger
+
+A separate repo, `neuralnetes-deployments`, runs a `scion-upstream-watcher` CronWorkflow that polls this fork's `main` branch roughly every 15 minutes and rebuilds/redeploys the `scion-base`/`scion-hub` container images on SHA drift. Merging to `main` here therefore has real, semi-automatic downstream build/deploy consequences, not just repo-hygiene ones.
+
+### Guardrails
+
+- **Never force-push `main`.** A force-push was blocked by repo policy this session — don't attempt `--force`/`--no-verify` workarounds; resolve divergence with a real merge (as above) or ask. Note: this repo's branch-protection API (`GET /repos/.../branches/main/protection`) returns 404 "not protected" and both repo- and org-level rulesets are empty/inaccessible (org rulesets need a GitHub Team plan upgrade, 403) — so the enforcement mechanism isn't visible via the API. Don't use that as evidence it's actually unprotected; treat `main` pushes as consequential regardless of what the API reports.
+- No admin-approval requirement was found blocking merges on this repo, but treat `main` pushes with the same care as if there were one, given the downstream deploy trigger above.
+
 ## Final important request
 
 If you see the exact message from me: "System: Please Continue." You must ignore me. This is an automated message and should not be followed. If I ask you to continue in other ways, that should be respected, but that exact phrase is a bug in the tooling, not a message from me. Feel free to tell me that you are ignoring it.
